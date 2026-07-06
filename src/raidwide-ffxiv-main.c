@@ -17,6 +17,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 */
 
 #include <obs-module.h>
+#include <obs-frontend-api.h>
 #include <plugin-support.h>
 
 OBS_DECLARE_MODULE()
@@ -27,6 +28,7 @@ struct raidwide_data {
 	obs_encoder_t *encoder_self;
 };
 
+/*
 const char *get_name(struct raidwide_data *type_data)
 {
 	UNUSED_PARAMETER(type_data);
@@ -67,12 +69,34 @@ struct obs_encoder_info raidwide_h264_encoder = {
 	.destroy = destroy,
 	.encode = encode,
 };
+*/
+
+bool enum_output_cb(void *data, obs_output_t *output)
+{
+	UNUSED_PARAMETER(data);
+	obs_log(LOG_INFO, "Found output: %s", obs_output_get_name(output));
+	// obs_output_add_packet_callback();
+	return true;
+}
+
+void frontend_event_cb(enum obs_frontend_event event, void *data)
+{
+	UNUSED_PARAMETER(data);
+	if (event == OBS_FRONTEND_EVENT_STREAMING_STARTED || event == OBS_FRONTEND_EVENT_RECORDING_STARTED)
+	{
+		obs_log(LOG_INFO, "Recording or streaming started, hooking output for raidwide data");
+		obs_enum_outputs(enum_output_cb, NULL);
+	}
+}
+
 
 bool obs_module_load(void)
 {
 	//obs_log(LOG_INFO, "Registering raidwide h264 encoder");
 	//obs_register_encoder(&raidwide_h264_encoder);
 
+	obs_frontend_add_event_callback(frontend_event_cb, NULL);
+	
 	obs_log(LOG_INFO, "Raidwide FFXIV plugin loaded successfully (version %s)", PLUGIN_VERSION);
 
 	return true;
