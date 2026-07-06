@@ -23,12 +23,12 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
 
+/*
 struct raidwide_data {
 	obs_encoder_t *inner_encoder;
 	obs_encoder_t *encoder_self;
 };
 
-/*
 const char *get_name(struct raidwide_data *type_data)
 {
 	UNUSED_PARAMETER(type_data);
@@ -71,11 +71,19 @@ struct obs_encoder_info raidwide_h264_encoder = {
 };
 */
 
+void packet_cb(obs_output_t *output, struct encoder_packet *pkt, struct encoder_packet_time *pkt_time, void *data)
+{
+	UNUSED_PARAMETER(data);
+	UNUSED_PARAMETER(pkt);
+	UNUSED_PARAMETER(pkt_time);
+	obs_log(LOG_INFO, "Received packet on output %s", obs_output_get_name(output));
+}
+
 bool enum_output_cb(void *data, obs_output_t *output)
 {
 	UNUSED_PARAMETER(data);
 	obs_log(LOG_INFO, "Found output: %s", obs_output_get_name(output));
-	// obs_output_add_packet_callback();
+	obs_output_add_packet_callback(output, packet_cb, NULL);
 	return true;
 }
 
