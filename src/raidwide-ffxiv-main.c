@@ -129,6 +129,10 @@ void packet_cb(obs_output_t *output, struct encoder_packet *pkt, struct encoder_
 {
 	UNUSED_PARAMETER(data);
 	UNUSED_PARAMETER(pkt_time);
+	if (pkt->type != OBS_ENCODER_VIDEO)
+	{
+		return;
+	}
 	obs_log(LOG_INFO, "Received packet of size %d on output %s", pkt->size, obs_output_get_name(output));
 
 	char *payload = "SEI RAIDWIDE";
