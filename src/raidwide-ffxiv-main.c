@@ -71,18 +71,86 @@ struct obs_encoder_info raidwide_h264_encoder = {
 };
 */
 
+#define SEI_UUID_SIZE 16
+#define SEI_START_CODE_SIZE 4
+#define SEI_NAL_TRAILING_SIZE 1
+
+
+struct nal_info
+{
+	size_t payload_size;
+	size_t total_nal_size;
+	size_t sei_size;
+	size_t sei_size_n_bytes;
+};
+
+struct nal_info get_nal_info(size_t payload_size)
+{
+	struct nal_info res;
+	res.sei_size = payload_size + SEI_UUID_SIZE;
+	res.sei_size_n_bytes = 1 + (res.sei_size / 255);
+	res.total_nal_size = SEI_START_CODE_SIZE + 1 + 1 + res.sei_size_n_bytes + res.sei_size  + SEI_NAL_TRAILING_SIZE;
+	res.payload_size = payload_size;
+	return res;
+}
+
+void emplace_sei_nal(uint8_t *dst, uint8_t *payload, const uint8_t *uuid, struct nal_info nal_info)
+{
+	// Start code
+	*dst++ = 0;
+	*dst++ = 0;
+	*dst++ = 0;
+	*dst++ = 1;
+
+	// NAL header (SEI = 6)
+	*dst++ = 6;
+	// Payload type (Unregistered User Data = 5)
+	*dst++ = 5;
+
+	size_t s = nal_info.sei_size;
+	while (s >= 0xff)
+	{
+		*dst++ = 0xff;
+		s -= 0xff;
+	}
+	*dst++ = (uint8_t) s;
+
+	memcpy(dst, uuid, SEI_UUID_SIZE);
+	dst += SEI_UUID_SIZE;
+
+	memcpy(dst, payload, nal_info.payload_size);
+	dst += nal_info.payload_size;
+
+	// Trailing byte
+	*dst++ = 0x80;
+}
+
 void packet_cb(obs_output_t *output, struct encoder_packet *pkt, struct encoder_packet_time *pkt_time, void *data)
 {
 	UNUSED_PARAMETER(data);
-	UNUSED_PARAMETER(pkt);
 	UNUSED_PARAMETER(pkt_time);
-	obs_log(LOG_INFO, "Received packet on output %s", obs_output_get_name(output));
+	obs_log(LOG_INFO, "Received packet of size %d on output %s", pkt->size, obs_output_get_name(output));
+
+	char *payload = "SEI RAIDWIDE";
+	size_t payload_size = strlen(payload);
+	struct nal_info nal_info = get_nal_info(payload_size);
+
+	size_t old_size = pkt->size;
+	pkt->size += nal_info.total_nal_size;
+	pkt->data = brealloc(pkt->data, pkt->size);
+	memmove(pkt->data + nal_info.total_nal_size, pkt->data, old_size);
+
+	const uint8_t uuid[16] = {0x72, 0x61, 0x69, 0x64, 0x77, 0x69, 0x64, 0x65,
+						0xff, 0x14, 0xff, 0x14, 0xff, 0x14, 0xff, 0x14};
+
+	emplace_sei_nal(pkt->data, payload, uuid, nal_info);
 }
 
 bool enum_output_cb(void *data, obs_output_t *output)
 {
 	UNUSED_PARAMETER(data);
 	obs_log(LOG_INFO, "Found output: %s", obs_output_get_name(output));
+	obs_output_remove_packet_callback(output, packet_cb, NULL);
 	obs_output_add_packet_callback(output, packet_cb, NULL);
 	return true;
 }
