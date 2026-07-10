@@ -162,6 +162,8 @@ extern "C" fn packet_cb(
     _pkt_time: *mut obs_sys::encoder_packet_time,
     _param: *mut ffi::c_void,
 ) {
+    const LINUX_REF_COUNT_OFFSFET: usize = size_of::<ffi::c_long>();
+
     let pkt = unsafe { pkt.as_mut_unchecked() };
     let output_name = unsafe { ffi::CStr::from_ptr(obs_sys::obs_output_get_name(output)) };
 
@@ -182,7 +184,16 @@ extern "C" fn packet_cb(
     };
 
     pkt.size += sei.encoded_size();
-    pkt.data = unsafe { obs_sys::brealloc(pkt.data as *mut _, pkt.size) as *mut _ };
+    // On linux the encoder_packet has a `ref_count: long` value allocated in
+    // front of pkt.
+    // TODO: check why this is not the case on windows.
+    pkt.data = unsafe {
+        obs_sys::brealloc(
+            pkt.data.byte_sub(LINUX_REF_COUNT_OFFSFET) as *mut _,
+            pkt.size + LINUX_REF_COUNT_OFFSFET,
+        )
+        .byte_add(LINUX_REF_COUNT_OFFSFET) as *mut _
+    };
     if pkt.data.is_null() {
         obs_log!(obs_sys::LOG_ERROR, "Cannot allocate space for SEI data");
         pkt.size -= sei.encoded_size();

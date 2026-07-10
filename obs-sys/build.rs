@@ -15,7 +15,9 @@ fn main() {
         .allowlist_var("LIBOBS_.*") // LIBOBS_API_MAJOR_VER, LIBOBS_API_MINOR_VER, LIBOBS_API_PATCH_VER
         .allowlist_var("LOG_.*") // LOG_ERROR, LOG_WARNING, LOG_INFO, LOG_DEBUG
         .allowlist_function("blog")
+        .allowlist_function("bmalloc")
         .allowlist_function("brealloc")
+        .allowlist_function("bfree")
         // TODO: add missing stuff (like brealloc)
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .generate()
