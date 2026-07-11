@@ -9,6 +9,9 @@ use std::slice;
 use std::sync;
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
+
+use crate::broadcast::Producer;
 
 static mut OBS_MODULE_POINTER: *mut obs_sys::obs_module_t = std::ptr::null_mut();
 
@@ -88,19 +91,34 @@ struct State<T: Clone> {
     thread_handle: thread::JoinHandle<()>,
 }
 
-type Msg = Arc<tungstenite::Message>;
+type Msg = Arc<String>;
 type SharedState = Option<State<Msg>>;
+
+fn ws_thread(prod: &mut Producer<Msg>) {
+    match tungstenite::connect("ws://127.0.0.1:10501/MiniParse")
+    {
+        Ok((mut ws, _res)) => {
+            obs_log!(obs_sys::LOG_INFO, "Connected to websocket");
+            loop {
+                prod.send(Arc::new(ws.read().unwrap().to_text().unwrap().to_string()))
+            }
+        }
+        Err(_) => {
+            obs_log!(obs_sys::LOG_INFO, "Failed to connect to websocket, falling back to dummy debug producer");
+            loop {
+                thread::sleep(Duration::from_secs(1));
+                prod.send(Arc::new("SEI RAIDWIDE".to_string()))
+            }
+        }
+    }
+}
 
 fn init_state(state: &mut SharedState) {
     obs_log!(obs_sys::LOG_INFO, "State initialization");
 
     let (mut prod, sub) = broadcast::broadcast_channel();
     let thread_handle = thread::spawn(move || {
-        let (mut ws, _res) = tungstenite::connect("ws://127.0.0.1:10501/MiniParse").unwrap();
-        obs_log!(obs_sys::LOG_INFO, "Connected to websocket");
-        loop {
-            prod.send(Arc::new(ws.read().unwrap()))
-        }
+        ws_thread(&mut prod);
     });
     *state = Some(State {
         sub,
@@ -193,7 +211,7 @@ extern "C" fn packet_cb(
 
     let mut buffer = vec![];
     while let Ok(msg) = receiver.try_recv() {
-        buffer.extend_from_slice(msg.to_text().unwrap().as_bytes())
+        buffer.extend_from_slice(msg.as_bytes())
     }
 
     if buffer.is_empty() {
