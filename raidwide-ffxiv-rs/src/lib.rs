@@ -1,4 +1,5 @@
 mod broadcast;
+mod calldata;
 mod log;
 mod sei;
 
@@ -159,7 +160,7 @@ extern "C" fn frontend_event_cb(
         }
         state.as_mut().unwrap().start_event_count += 1;
 
-        obs_info!("Recording or streaming started, hooking output");
+        obs_info!("Hooking outputs");
         unsafe { obs_sys::obs_enum_outputs(Some(enum_output_cb), private_data) };
     }
 
@@ -182,33 +183,104 @@ extern "C" fn enum_output_cb(data: *mut ffi::c_void, output: *mut obs_sys::obs_o
     };
 
     let output_name = unsafe { ffi::CStr::from_ptr(obs_sys::obs_output_get_name(output)) };
-    if !state.receivers.contains_key(output_name) {
-        obs_debug!(
-            "Create new receiver for output {}",
+
+    let signal_handler = unsafe { obs_sys::obs_output_get_signal_handler(output) };
+
+    obs_info!(
+        "Adding signal handlers for output {}",
+        output_name.to_string_lossy()
+    );
+    unsafe {
+        obs_sys::signal_handler_connect(
+            signal_handler,
+            c"start".as_ptr(),
+            Some(output_start_cb),
+            ptr::from_mut(state).cast(),
+        );
+        obs_sys::signal_handler_connect(
+            signal_handler,
+            c"stop".as_ptr(),
+            Some(output_stop_cb),
+            ptr::from_mut(state).cast(),
+        );
+    };
+
+    true
+}
+
+extern "C" fn output_start_cb(data: *mut ffi::c_void, callback_data: *mut obs_sys::calldata_t) {
+    // TODO: make this thread safe?
+    let state = unsafe {
+        data.cast::<SharedState>()
+            .as_mut_unchecked()
+            .as_mut()
+            .unwrap()
+    };
+
+    let output =
+        unsafe { calldata::calldata_ptr(callback_data, c"output").cast::<obs_sys::obs_output_t>() };
+    let output_name = unsafe { ffi::CStr::from_ptr(obs_sys::obs_output_get_name(output)) };
+
+    if state
+        .receivers
+        .insert(output_name.to_owned(), state.sub.subscribe())
+        .is_some()
+    {
+        obs_warning!(
+            "Registering packet callback for output {}, but state already existed with the same name",
             output_name.to_string_lossy()
         );
-        state
-            .receivers
-            .insert(output_name.to_owned(), state.sub.subscribe());
     }
-    let receiver = state.receivers.get_mut(output_name).unwrap();
 
+    let receiver = state.receivers.get_mut(output_name).unwrap();
+    obs_debug!(
+        "Registering packet callback for output {}",
+        output_name.to_string_lossy()
+    );
     unsafe {
-        // TODO: instead register a callback when obs_output are removed to
-        // remove the callback there.
         obs_sys::obs_output_remove_packet_callback(
             output,
             Some(packet_cb),
             ptr::from_mut(receiver).cast(),
-        );
-        obs_sys::obs_output_add_packet_callback(
+        )
+    };
+}
+
+extern "C" fn output_stop_cb(data: *mut ffi::c_void, callback_data: *mut obs_sys::calldata_t) {
+    // TODO: make this thread safe?
+    let state = unsafe {
+        data.cast::<SharedState>()
+            .as_mut_unchecked()
+            .as_mut()
+            .unwrap()
+    };
+
+    let output =
+        unsafe { calldata::calldata_ptr(callback_data, c"output").cast::<obs_sys::obs_output_t>() };
+    let output_name = unsafe { ffi::CStr::from_ptr(obs_sys::obs_output_get_name(output)) };
+
+    let mut receiver = match state.receivers.remove(output_name) {
+        None => {
+            obs_warning!(
+                "Unregistering packet callback for output {}, but state does not contain any output with this name",
+                output_name.to_string_lossy()
+            );
+            return;
+        }
+        Some(receiver) => receiver,
+    };
+
+    obs_debug!(
+        "Unregistering packet callback for output {}",
+        output_name.to_string_lossy()
+    );
+    unsafe {
+        obs_sys::obs_output_remove_packet_callback(
             output,
             Some(packet_cb),
-            ptr::from_mut(receiver).cast(),
-        );
-    }
-
-    true
+            ptr::from_mut(&mut receiver).cast(),
+        )
+    };
 }
 
 // On linux the encoder_packet has a `ref_count: long` value allocated in

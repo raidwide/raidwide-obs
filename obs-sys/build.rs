@@ -18,6 +18,8 @@ fn main() {
         .allowlist_function("bmalloc")
         .allowlist_function("brealloc")
         .allowlist_function("bfree")
+        .allowlist_function("signal_handler_.*")
+        .allowlist_function("calldata_.*")
         // TODO: add missing stuff (like brealloc)
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .generate()

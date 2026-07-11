@@ -22,26 +22,27 @@ macro_rules! obs_log {
 #[macro_export]
 macro_rules! obs_debug {
     ($($arg:tt)*) => {{
-        obs_log!(obs_sys::LOG_DEBUG, $($arg)*)
+        $crate::obs_log!(obs_sys::LOG_DEBUG, $($arg)*)
     }};
 }
 
 #[macro_export]
 macro_rules! obs_info {
     ($($arg:tt)*) => {{
-        obs_log!(obs_sys::LOG_INFO, $($arg)*)
+        $crate::obs_log!(obs_sys::LOG_INFO, $($arg)*)
     }};
 }
 
 #[macro_export]
 macro_rules! obs_warning {
     ($($arg:tt)*) => {{
-        obs_log!(obs_sys::LOG_WARNING, $($arg)*)
+        $crate::obs_log!(obs_sys::LOG_WARNING, $($arg)*)
     }};
 }
+
 #[macro_export]
 macro_rules! obs_error {
     ($($arg:tt)*) => {{
-        obs_log!(obs_sys::LOG_ERROR, $($arg)*)
+        $crate::obs_log!(obs_sys::LOG_ERROR, $($arg)*)
     }};
 }
