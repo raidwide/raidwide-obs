@@ -127,6 +127,8 @@ void emplace_sei_nal(uint8_t *dst, uint8_t *payload, const uint8_t *uuid, struct
 
 void packet_cb(obs_output_t *output, struct encoder_packet *pkt, struct encoder_packet_time *pkt_time, void *data)
 {
+	obs_log(LOG_INFO, "Callback on output: %s", obs_output_get_name(output));
+	obs_log(LOG_INFO, "Callback on output: %s", obs_output_get_id(output));
 	UNUSED_PARAMETER(data);
 	UNUSED_PARAMETER(pkt_time);
 	if (pkt->type != OBS_ENCODER_VIDEO)
@@ -147,7 +149,7 @@ void packet_cb(obs_output_t *output, struct encoder_packet *pkt, struct encoder_
 	const uint8_t uuid[16] = {0x72, 0x61, 0x69, 0x64, 0x77, 0x69, 0x64, 0x65,
 						0xff, 0x14, 0xff, 0x14, 0xff, 0x14, 0xff, 0x14};
 
-	emplace_sei_nal(pkt->data, payload, uuid, nal_info);
+	emplace_sei_nal(pkt->data, (uint8_t *) payload, uuid, nal_info);
 }
 
 bool enum_output_cb(void *data, obs_output_t *output)
