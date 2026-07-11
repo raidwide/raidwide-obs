@@ -7,4 +7,6 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
+bus = "2.4.1"
 obs-sys = { path = "../obs-sys" }
+tungstenite = "0.29.0"
