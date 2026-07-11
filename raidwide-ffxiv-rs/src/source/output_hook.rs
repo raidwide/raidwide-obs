@@ -1,0 +1,345 @@
+use std::collections::HashMap;
+use std::ffi;
+use std::mem;
+use std::ptr;
+use std::slice;
+use std::sync;
+use std::sync::Arc;
+use std::thread;
+use std::time;
+
+use crate::broadcast;
+use crate::calldata;
+use crate::sei;
+use crate::source::RaidwideSource;
+use crate::{obs_debug, obs_error, obs_info, obs_warning};
+
+pub type Msg = Arc<Vec<u8>>;
+
+#[derive(Default)]
+pub enum RaidwideSourceState {
+    #[default]
+    Idle,
+    Running {
+        thread_handle: thread::JoinHandle<()>,
+        start_event_count: usize,
+        consumer: broadcast::ConsumerGenerator<Msg>,
+        receivers: HashMap<ffi::CString, sync::mpsc::Receiver<Msg>>,
+    },
+}
+
+impl RaidwideSourceState {
+    fn start(&mut self, data: *mut ffi::c_void) {
+        obs_debug!("Starting raidwide");
+        assert!(matches!(self, Self::Idle));
+
+        let source = unsafe { data.cast::<RaidwideSource>().as_mut_unchecked() };
+
+        let (mut producer, consumer) = broadcast::broadcast_channel();
+        let thread_handle = thread::spawn({
+            let url = source.ws_url.clone();
+            move || {
+                ws_thread(&mut producer, &url);
+            }
+        });
+
+        *self = Self::Running {
+            consumer,
+            receivers: HashMap::new(),
+            thread_handle,
+            start_event_count: 1,
+        };
+
+        obs_info!("Hooking outputs");
+        unsafe { obs_sys::obs_enum_outputs(Some(enum_output_cb), data) };
+
+        obs_debug!("Raidwide started");
+    }
+
+    fn stop(&mut self, _data: *mut ffi::c_void) {
+        obs_debug!("Stopping raidwide");
+        assert!(matches!(self, Self::Running { .. }));
+
+        let state = mem::replace(self, Self::Idle);
+
+        match state {
+            Self::Idle => panic!("State management error"),
+            Self::Running {
+                mut consumer,
+                mut receivers,
+                thread_handle,
+                ..
+            } => {
+                consumer.close();
+                thread_handle.join().unwrap();
+
+                for (output_name, receiver) in receivers.iter_mut() {
+                    let output = unsafe { obs_sys::obs_get_output_by_name(output_name.as_ptr()) };
+                    if output.is_null() {
+                        obs_warning!(
+                            "Cannot remove callback for {} because no output with that name were found",
+                            output_name.to_string_lossy()
+                        );
+                        continue;
+                    }
+
+                    unsafe {
+                        obs_sys::obs_output_remove_packet_callback(
+                            output,
+                            Some(packet_cb),
+                            ptr::from_mut(receiver).cast(),
+                        );
+                        obs_sys::obs_output_release(output);
+                    }
+                }
+            }
+        }
+
+        obs_debug!("Raidwide stopped");
+    }
+
+    pub fn try_start(&mut self, data: *mut ffi::c_void) {
+        match self {
+            Self::Idle => {
+                self.start(data);
+            }
+            Self::Running {
+                start_event_count, ..
+            } => *start_event_count += 1,
+        }
+    }
+
+    pub fn try_stop(&mut self, data: *mut ffi::c_void) {
+        match self {
+            Self::Running {
+                start_event_count, ..
+            } => {
+                *start_event_count -= 1;
+                if *start_event_count == 0 {
+                    self.stop(data);
+                }
+            }
+            Self::Idle => obs_warning!("stop was called more than start"),
+        }
+    }
+}
+
+fn ws_thread(prod: &mut broadcast::Producer<Msg>, url: &str) {
+    match tungstenite::connect(url) {
+        Ok((mut ws, _res)) => {
+            obs_info!("Connected to {url}");
+            loop {
+                let msg = match ws.read() {
+                    Ok(msg) => msg,
+                    Err(e) => {
+                        obs_warning!("Error reading from websocket: {e}");
+                        break;
+                    }
+                };
+                if let Err(_) = prod.send(Arc::new(msg.into_data().into())) {
+                    break;
+                }
+            }
+        }
+        Err(e) => {
+            obs_warning!("Failed to connect to {url}, falling back to dummy debug producer: {e}");
+            loop {
+                thread::sleep(time::Duration::from_secs(1));
+                obs_debug!("sending data");
+                if let Err(_) = prod.send(Arc::new(b"SEI RAIDWIDE".to_vec())) {
+                    break;
+                }
+            }
+        }
+    }
+    obs_debug!("Websocket thread finished");
+}
+
+pub extern "C" fn frontend_event_cb(
+    event: obs_sys::obs_frontend_event,
+    private_data: *mut ffi::c_void,
+) {
+    let source = unsafe { private_data.cast::<RaidwideSource>().as_mut_unchecked() };
+
+    if event == obs_sys::obs_frontend_event_OBS_FRONTEND_EVENT_STREAMING_STARTED
+        || event == obs_sys::obs_frontend_event_OBS_FRONTEND_EVENT_RECORDING_STARTED
+    {
+        source.state.try_start(private_data);
+    }
+
+    if event == obs_sys::obs_frontend_event_OBS_FRONTEND_EVENT_STREAMING_STOPPED
+        || event == obs_sys::obs_frontend_event_OBS_FRONTEND_EVENT_RECORDING_STOPPED
+    {
+        source.state.try_stop(private_data);
+    }
+}
+
+extern "C" fn enum_output_cb(data: *mut ffi::c_void, output: *mut obs_sys::obs_output_t) -> bool {
+    let output_name = unsafe { ffi::CStr::from_ptr(obs_sys::obs_output_get_name(output)) };
+    let signal_handler = unsafe { obs_sys::obs_output_get_signal_handler(output) };
+
+    obs_info!(
+        "Adding signal handlers for output {}",
+        output_name.to_string_lossy()
+    );
+    unsafe {
+        obs_sys::signal_handler_connect(
+            signal_handler,
+            c"start".as_ptr(),
+            Some(output_start_cb),
+            data,
+        );
+        obs_sys::signal_handler_connect(
+            signal_handler,
+            c"stop".as_ptr(),
+            Some(output_stop_cb),
+            data,
+        );
+    };
+
+    true
+}
+
+extern "C" fn output_start_cb(data: *mut ffi::c_void, callback_data: *mut obs_sys::calldata_t) {
+    // TODO: make this thread safe?
+    let source = unsafe { data.cast::<RaidwideSource>().as_mut_unchecked() };
+    let (consumer, receivers) = match &mut source.state {
+        RaidwideSourceState::Running {
+            consumer,
+            receivers,
+            ..
+        } => (consumer, receivers),
+        _ => {
+            obs_warning!("Raidwide is not running");
+            return;
+        }
+    };
+
+    let output =
+        unsafe { calldata::calldata_ptr(callback_data, c"output").cast::<obs_sys::obs_output_t>() };
+    let output_name = unsafe { ffi::CStr::from_ptr(obs_sys::obs_output_get_name(output)) };
+
+    if receivers
+        .insert(output_name.to_owned(), consumer.subscribe())
+        .is_some()
+    {
+        obs_warning!(
+            "Registering packet callback for output {}, but state already existed with the same name",
+            output_name.to_string_lossy()
+        );
+    }
+
+    let receiver = receivers.get_mut(output_name).unwrap();
+    obs_debug!(
+        "Registering packet callback for output {}",
+        output_name.to_string_lossy()
+    );
+    unsafe {
+        obs_sys::obs_output_add_packet_callback(
+            output,
+            Some(packet_cb),
+            ptr::from_mut(receiver).cast(),
+        )
+    };
+}
+
+extern "C" fn output_stop_cb(data: *mut ffi::c_void, callback_data: *mut obs_sys::calldata_t) {
+    // TODO: make this thread safe?
+    let source = unsafe { data.cast::<RaidwideSource>().as_mut_unchecked() };
+    let receivers = match &mut source.state {
+        RaidwideSourceState::Running { receivers, .. } => receivers,
+        _ => {
+            obs_warning!("Raidwide is not running");
+            return;
+        }
+    };
+
+    let output =
+        unsafe { calldata::calldata_ptr(callback_data, c"output").cast::<obs_sys::obs_output_t>() };
+    let output_name = unsafe { ffi::CStr::from_ptr(obs_sys::obs_output_get_name(output)) };
+
+    let mut receiver = match receivers.remove(output_name) {
+        None => {
+            obs_warning!(
+                "Unregistering packet callback for output {}, but state does not contain any output with this name",
+                output_name.to_string_lossy()
+            );
+            return;
+        }
+        Some(receiver) => receiver,
+    };
+
+    obs_debug!(
+        "Unregistering packet callback for output {}",
+        output_name.to_string_lossy()
+    );
+    unsafe {
+        obs_sys::obs_output_remove_packet_callback(
+            output,
+            Some(packet_cb),
+            ptr::from_mut(&mut receiver).cast(),
+        )
+    };
+}
+
+// On linux the encoder_packet has a `ref_count: long` value allocated in
+// front of pkt.
+// TODO: check why this is not the case on windows.
+#[cfg(not(target_os = "windows"))]
+const ENCODER_PACKET_ALLOC_OFFSET: usize = size_of::<ffi::c_long>();
+#[cfg(target_os = "windows")]
+const ENCODER_PACKET_ALLOC_OFFSET: usize = 0;
+
+extern "C" fn packet_cb(
+    output: *mut obs_sys::obs_output_t,
+    pkt: *mut obs_sys::encoder_packet,
+    _pkt_time: *mut obs_sys::encoder_packet_time,
+    param: *mut ffi::c_void,
+) {
+    let pkt = unsafe { pkt.as_mut_unchecked() };
+    if pkt.type_ != obs_sys::obs_encoder_type_OBS_ENCODER_VIDEO {
+        return;
+    }
+
+    let receiver = unsafe { param.cast::<sync::mpsc::Receiver<Msg>>().as_mut_unchecked() };
+    let output_name = unsafe { ffi::CStr::from_ptr(obs_sys::obs_output_get_name(output)) };
+    obs_debug!(
+        "Received packet of size {} on output {}",
+        pkt.size,
+        output_name.to_string_lossy()
+    );
+
+    let mut buffer = vec![];
+    while let Ok(msg) = receiver.try_recv() {
+        buffer.extend_from_slice(&msg)
+    }
+
+    if buffer.is_empty() {
+        return;
+    }
+
+    let sei_data = sei::SeiUserDataUnregistered::new(&sei::RAIDWIDE_UUID, &buffer);
+
+    pkt.size += sei_data.encoded_size();
+    pkt.data = unsafe {
+        obs_sys::brealloc(
+            pkt.data.byte_sub(ENCODER_PACKET_ALLOC_OFFSET).cast(),
+            pkt.size + ENCODER_PACKET_ALLOC_OFFSET,
+        )
+        .byte_add(ENCODER_PACKET_ALLOC_OFFSET)
+        .cast()
+    };
+    if pkt.data.is_null() {
+        obs_error!("Cannot allocate space for SEI data");
+        // TODO: signal error
+        pkt.size -= sei_data.encoded_size();
+        return;
+    }
+
+    let data = unsafe { slice::from_raw_parts_mut(pkt.data, pkt.size) };
+    sei_data
+        .encode(&mut data[pkt.size - sei_data.encoded_size()..])
+        .unwrap();
+
+    obs_info!("Appended {} bytes of SEI data", sei_data.encoded_size());
+}

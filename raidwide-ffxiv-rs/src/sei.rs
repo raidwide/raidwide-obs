@@ -3,6 +3,10 @@ use std::io::Write;
 
 pub const UUID_SIZE: usize = 16;
 
+pub const RAIDWIDE_UUID: [u8; UUID_SIZE] = [
+    0x72, 0x61, 0x69, 0x64, 0x77, 0x69, 0x64, 0x65, 0xFF, 0x14, 0xFF, 0x14, 0xFF, 0x14, 0xFF, 0x14,
+];
+
 pub struct SeiUserDataUnregistered<'u, 'p> {
     uuid: &'u [u8; UUID_SIZE],
     payload: &'p [u8],

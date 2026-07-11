@@ -14,13 +14,13 @@ fn main() {
         .allowlist_item("OBS_.*")
         .allowlist_var("LIBOBS_.*") // LIBOBS_API_MAJOR_VER, LIBOBS_API_MINOR_VER, LIBOBS_API_PATCH_VER
         .allowlist_var("LOG_.*") // LOG_ERROR, LOG_WARNING, LOG_INFO, LOG_DEBUG
+        .allowlist_function("signal_handler_.*")
+        .allowlist_function("calldata_.*")
         .allowlist_function("blog")
         .allowlist_function("bmalloc")
         .allowlist_function("brealloc")
         .allowlist_function("bfree")
-        .allowlist_function("signal_handler_.*")
-        .allowlist_function("calldata_.*")
-        // TODO: add missing stuff (like brealloc)
+        .allowlist_function("bcrash")
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .generate()
         .expect("Unable to generate bindings");
