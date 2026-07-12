@@ -12,7 +12,7 @@ use crate::broadcast;
 use crate::calldata;
 use crate::sei;
 use crate::source::RaidwideSource;
-use crate::{obs_debug, obs_error, obs_info, obs_warning};
+use crate::{obs_debug, obs_info, obs_warning};
 
 pub type Msg = Arc<Vec<u8>>;
 
@@ -187,7 +187,6 @@ impl RaidwideSourceState {
                 ptr::from_mut(receiver).cast(),
             )
         };
-
         receivers.remove(output_name).unwrap();
     }
 }
@@ -294,11 +293,11 @@ const ENCODER_PACKET_ALLOC_OFFSET: usize = 0;
 
 extern "C" fn packet_cb(
     output: *mut obs_sys::obs_output_t,
-    pkt: *mut obs_sys::encoder_packet,
+    pkt_ref: *mut obs_sys::encoder_packet,
     _pkt_time: *mut obs_sys::encoder_packet_time,
     param: *mut ffi::c_void,
 ) {
-    let pkt = unsafe { pkt.as_mut_unchecked() };
+    let mut pkt = unsafe { pkt_ref.as_mut_unchecked() }.to_owned();
     if pkt.type_ != obs_sys::obs_encoder_type_OBS_ENCODER_VIDEO {
         return;
     }
@@ -328,26 +327,37 @@ extern "C" fn packet_cb(
     let sei_data = sei::SeiUserDataUnregistered::new(&sei::RAIDWIDE_UUID, &buffer);
     let sei_size = sei_data.encoded_h264_size();
 
-    pkt.size += sei_size;
-    pkt.data = unsafe {
-        obs_sys::brealloc(
-            pkt.data.byte_sub(ENCODER_PACKET_ALLOC_OFFSET).cast(),
-            pkt.size + ENCODER_PACKET_ALLOC_OFFSET,
-        )
-        .byte_add(ENCODER_PACKET_ALLOC_OFFSET)
-        .cast()
+    // to properly handle ref_count on encoder_packet, we create a new
+    // encoder_packet with a ref_count of 1 with our sei data prepended to the
+    // original data, and decrement the ref_count of the original packet.
+    let old_pkt_data = unsafe { slice::from_raw_parts(pkt.data, pkt.size) };
+    let new_pkt_data = unsafe {
+        let new_pkt_size = ENCODER_PACKET_ALLOC_OFFSET + sei_size + old_pkt_data.len();
+        slice::from_raw_parts_mut(obs_sys::bmalloc(new_pkt_size).cast::<u8>(), new_pkt_size)
     };
-    if pkt.data.is_null() {
-        obs_error!("Cannot allocate space for SEI data");
-        // TODO: signal error
-        pkt.size -= sei_size;
-        return;
-    }
 
-    let data = unsafe { slice::from_raw_parts_mut(pkt.data, pkt.size) };
+    new_pkt_data[0..ENCODER_PACKET_ALLOC_OFFSET]
+        .copy_from_slice(&ffi::c_long::from(1).to_ne_bytes());
     sei_data
-        .encode_h264(&mut data[pkt.size - sei_size..])
+        .encode_h264(
+            &mut new_pkt_data[ENCODER_PACKET_ALLOC_OFFSET..ENCODER_PACKET_ALLOC_OFFSET + sei_size],
+        )
         .unwrap();
+    new_pkt_data[ENCODER_PACKET_ALLOC_OFFSET + sei_size..].copy_from_slice(old_pkt_data);
+
+    unsafe { obs_sys::obs_encoder_packet_release(pkt_ref) };
+
+    pkt.size = new_pkt_data.len() - ENCODER_PACKET_ALLOC_OFFSET;
+    pkt.data = unsafe {
+        new_pkt_data
+            .as_mut_ptr()
+            .byte_add(ENCODER_PACKET_ALLOC_OFFSET)
+    };
+
+    unsafe {
+        // TODO: check if its aligned
+        ptr::write_unaligned(pkt_ref, pkt);
+    }
 
     obs_info!("Appended {} bytes of SEI data", sei_size);
 }
