@@ -2,6 +2,7 @@ use std::ffi;
 use std::mem;
 
 use crate::obs_debug;
+use crate::source::output_hook::RaidwideSourceState;
 
 mod output_hook;
 
@@ -48,7 +49,18 @@ unsafe extern "C" fn create(
 }
 
 unsafe extern "C" fn destroy(data: *mut ffi::c_void) {
-    let source: Box<RaidwideSource> = unsafe { Box::from_raw(data.cast()) };
+    let mut source: Box<RaidwideSource> = unsafe { Box::from_raw(data.cast()) };
+
+    if source.callback_registered {
+        unsafe {
+            obs_sys::obs_frontend_remove_event_callback(Some(output_hook::frontend_event_cb), data);
+        }
+    }
+
+    if matches!(source.state, RaidwideSourceState::Running { .. }) {
+        source.state.stop(data);
+    }
+
     drop(source)
 }
 
