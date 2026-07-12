@@ -26,7 +26,7 @@ impl<'u, 'p> SeiUserDataUnregistered<'u, 'p> {
         self.uuid.len() + self.payload.len()
     }
 
-    pub fn encoded_size(&self) -> usize {
+    pub fn encoded_h264_size(&self) -> usize {
         Self::START_CODE.len()
             + Self::NAL_HEADER.len()
             + Self::PAYLOAD_TYPE.len()
@@ -35,8 +35,8 @@ impl<'u, 'p> SeiUserDataUnregistered<'u, 'p> {
             + Self::NAL_TRAILER.len()
     }
 
-    pub fn encode(&self, out: &mut [u8]) -> io::Result<usize> {
-        if out.len() < self.encoded_size() {
+    pub fn encode_h264(&self, out: &mut [u8]) -> io::Result<usize> {
+        if out.len() < self.encoded_h264_size() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "output buffer is too small",
