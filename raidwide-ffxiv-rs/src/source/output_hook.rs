@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::ffi;
 use std::mem;
 use std::ptr;
@@ -26,6 +27,7 @@ pub enum RaidwideSourceState {
         consumer: broadcast::ConsumerGenerator<Msg>,
         // TODO: thread-safe?
         receivers: HashMap<ffi::CString, sync::mpsc::Receiver<Msg>>,
+        signal_subscribed: HashSet<ffi::CString>,
     },
 }
 
@@ -47,12 +49,10 @@ impl RaidwideSourceState {
         *self = Self::Running {
             consumer,
             receivers: HashMap::new(),
+            signal_subscribed: HashSet::new(),
             thread_handle,
             start_event_count: 1,
         };
-
-        obs_info!("Hooking outputs");
-        unsafe { obs_sys::obs_enum_outputs(Some(enum_output_cb), data) };
 
         obs_debug!("Raidwide started");
     }
@@ -104,6 +104,8 @@ impl RaidwideSourceState {
         match self {
             Self::Idle => {
                 self.start(data);
+                obs_info!("Hooking outputs");
+                unsafe { obs_sys::obs_enum_outputs(Some(enum_output_cb), data) };
             }
             Self::Running {
                 start_event_count, ..
@@ -166,6 +168,7 @@ impl RaidwideSourceState {
 
     pub fn unregister_output_hook(&mut self, output: *mut obs_sys::obs_output_t) {
         let output_name = unsafe { ffi::CStr::from_ptr(obs_sys::obs_output_get_name(output)) };
+
         obs_debug!(
             "Unregistering packet callback for output {}",
             output_name.to_string_lossy()
@@ -179,6 +182,14 @@ impl RaidwideSourceState {
             }
         };
 
+        if !receivers.contains_key(output_name) {
+            obs_warning!(
+                "Packet callbacks were already unregistered for output {}, ignoring",
+                output_name.to_string_lossy()
+            );
+            return;
+        }
+
         let receiver = receivers.get_mut(output_name).unwrap();
         unsafe {
             obs_sys::obs_output_remove_packet_callback(
@@ -188,6 +199,53 @@ impl RaidwideSourceState {
             )
         };
         receivers.remove(output_name).unwrap();
+    }
+
+    pub fn unregister_output_signal_hooks(
+        &mut self,
+        output: *mut obs_sys::obs_output_t,
+        data: *mut ffi::c_void,
+    ) {
+        let output_name = unsafe { ffi::CStr::from_ptr(obs_sys::obs_output_get_name(output)) };
+        obs_debug!(
+            "Unregistering signal callbacks for output {}",
+            output_name.to_string_lossy()
+        );
+
+        self.unregister_output_hook(output);
+
+        let signal_subscribed = match self {
+            RaidwideSourceState::Running {
+                signal_subscribed, ..
+            } => signal_subscribed,
+            _ => {
+                obs_warning!("Raidwide is not running");
+                return;
+            }
+        };
+
+        let signal_handler = unsafe { obs_sys::obs_output_get_signal_handler(output) };
+        unsafe {
+            obs_sys::signal_handler_disconnect(
+                signal_handler,
+                c"activate".as_ptr(),
+                Some(output_activate_cb),
+                data,
+            );
+            obs_sys::signal_handler_disconnect(
+                signal_handler,
+                c"deactivate".as_ptr(),
+                Some(output_deactivate_cb),
+                data,
+            );
+            obs_sys::signal_handler_disconnect(
+                signal_handler,
+                c"stop".as_ptr(),
+                Some(output_stop_cb),
+                data,
+            );
+        };
+        signal_subscribed.remove(output_name);
     }
 }
 
@@ -245,42 +303,79 @@ extern "C" fn enum_output_cb(data: *mut ffi::c_void, output: *mut obs_sys::obs_o
     let output_name = unsafe { ffi::CStr::from_ptr(obs_sys::obs_output_get_name(output)) };
     let signal_handler = unsafe { obs_sys::obs_output_get_signal_handler(output) };
 
-    obs_info!(
-        "Adding signal handlers for output {}",
-        output_name.to_string_lossy()
-    );
-    unsafe {
-        obs_sys::signal_handler_connect(
-            signal_handler,
-            c"start".as_ptr(),
-            Some(output_start_cb),
-            data,
-        );
-        obs_sys::signal_handler_connect(
-            signal_handler,
-            c"stop".as_ptr(),
-            Some(output_stop_cb),
-            data,
-        );
-    };
+    let source = unsafe { data.cast::<RaidwideSource>().as_mut_unchecked() };
 
-    // TODO: register the output if it is running
+    match &mut source.state {
+        RaidwideSourceState::Idle => {
+            obs_warning!("Enumerating outputs while raidwide is not running");
+            return false;
+        }
+        RaidwideSourceState::Running {
+            signal_subscribed, ..
+        } => {
+            if signal_subscribed.contains(output_name) {
+                obs_debug!("Duplicate output signal subscription detected, ignoring");
+                return true;
+            }
+
+            obs_info!(
+                "Adding signal handlers for output {}",
+                output_name.to_string_lossy()
+            );
+
+            signal_subscribed.insert(output_name.to_owned());
+            unsafe {
+                obs_sys::signal_handler_connect(
+                    signal_handler,
+                    c"activate".as_ptr(),
+                    Some(output_activate_cb),
+                    data,
+                );
+                obs_sys::signal_handler_connect(
+                    signal_handler,
+                    c"deactivate".as_ptr(),
+                    Some(output_deactivate_cb),
+                    data,
+                );
+                obs_sys::signal_handler_connect(
+                    signal_handler,
+                    c"stop".as_ptr(),
+                    Some(output_stop_cb),
+                    data,
+                );
+
+                if obs_sys::obs_output_active(output) {
+                    source.state.register_output_hook(output);
+                }
+            };
+        }
+    }
 
     true
 }
 
-extern "C" fn output_start_cb(data: *mut ffi::c_void, callback_data: *mut obs_sys::calldata_t) {
+extern "C" fn output_activate_cb(data: *mut ffi::c_void, callback_data: *mut obs_sys::calldata_t) {
     let source = unsafe { data.cast::<RaidwideSource>().as_mut_unchecked() };
     let output =
         unsafe { calldata::calldata_ptr(callback_data, c"output").cast::<obs_sys::obs_output_t>() };
     source.state.register_output_hook(output);
 }
 
-extern "C" fn output_stop_cb(data: *mut ffi::c_void, callback_data: *mut obs_sys::calldata_t) {
+extern "C" fn output_deactivate_cb(
+    data: *mut ffi::c_void,
+    callback_data: *mut obs_sys::calldata_t,
+) {
     let source = unsafe { data.cast::<RaidwideSource>().as_mut_unchecked() };
     let output =
         unsafe { calldata::calldata_ptr(callback_data, c"output").cast::<obs_sys::obs_output_t>() };
     source.state.unregister_output_hook(output);
+}
+
+extern "C" fn output_stop_cb(data: *mut ffi::c_void, callback_data: *mut obs_sys::calldata_t) {
+    let source = unsafe { data.cast::<RaidwideSource>().as_mut_unchecked() };
+    let output =
+        unsafe { calldata::calldata_ptr(callback_data, c"output").cast::<obs_sys::obs_output_t>() };
+    source.state.unregister_output_signal_hooks(output, data);
 }
 
 // On linux the encoder_packet has a `ref_count: long` value allocated in
