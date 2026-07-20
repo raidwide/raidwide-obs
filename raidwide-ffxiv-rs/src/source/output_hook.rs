@@ -391,7 +391,7 @@ extern "C" fn packet_cb(
 ) {
     let mut pkt = unsafe { pkt_ref.as_mut_unchecked() }.to_owned();
     if pkt.type_ != obs_sys::obs_encoder_type_OBS_ENCODER_VIDEO {
-        return
+        return;
     }
 
     if unsafe { ffi::CStr::from_ptr(obs_sys::obs_encoder_get_codec(pkt.encoder)) } != c"h264" {
