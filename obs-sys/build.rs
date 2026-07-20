@@ -33,10 +33,6 @@ fn main() {
         .allowlist_function("brealloc")
         .allowlist_function("bfree")
         .allowlist_function("bcrash")
-        .blocklist_type("_bindgen_ty_2")
-        .blocklist_type("_bindgen_ty_3")
-        .blocklist_type("_bindgen_ty_4")
-        .derive_default(true)
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .generate()
         .expect("Unable to generate bindings");
