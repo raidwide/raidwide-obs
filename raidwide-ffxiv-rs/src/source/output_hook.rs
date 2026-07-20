@@ -381,10 +381,7 @@ extern "C" fn output_stop_cb(data: *mut ffi::c_void, callback_data: *mut obs_sys
 // On linux the encoder_packet has a `ref_count: long` value allocated in
 // front of pkt.
 // TODO: check why this is not the case on windows.
-#[cfg(not(target_os = "windows"))]
 const ENCODER_PACKET_ALLOC_OFFSET: usize = size_of::<ffi::c_long>();
-#[cfg(target_os = "windows")]
-const ENCODER_PACKET_ALLOC_OFFSET: usize = 0;
 
 extern "C" fn packet_cb(
     output: *mut obs_sys::obs_output_t,
@@ -394,7 +391,7 @@ extern "C" fn packet_cb(
 ) {
     let mut pkt = unsafe { pkt_ref.as_mut_unchecked() }.to_owned();
     if pkt.type_ != obs_sys::obs_encoder_type_OBS_ENCODER_VIDEO {
-        return;
+        return
     }
 
     if unsafe { ffi::CStr::from_ptr(obs_sys::obs_encoder_get_codec(pkt.encoder)) } != c"h264" {
@@ -428,7 +425,8 @@ extern "C" fn packet_cb(
     let old_pkt_data = unsafe { slice::from_raw_parts(pkt.data, pkt.size) };
     let new_pkt_data = unsafe {
         let new_pkt_size = ENCODER_PACKET_ALLOC_OFFSET + sei_size + old_pkt_data.len();
-        slice::from_raw_parts_mut(obs_sys::bmalloc(new_pkt_size).cast::<u8>(), new_pkt_size)
+        let new_pkt_ptr = obs_sys::bmalloc(new_pkt_size);
+        slice::from_raw_parts_mut(new_pkt_ptr.cast::<u8>(), new_pkt_size)
     };
 
     new_pkt_data[0..ENCODER_PACKET_ALLOC_OFFSET]
