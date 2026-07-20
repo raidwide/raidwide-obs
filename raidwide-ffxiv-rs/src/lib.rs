@@ -1,0 +1,44 @@
+mod broadcast;
+mod calldata;
+mod log;
+mod sei;
+mod source;
+
+static mut OBS_MODULE_POINTER: *mut obs_sys::obs_module_t = std::ptr::null_mut();
+
+pub const PLUGIN_NAME: &str = env!("CARGO_PKG_NAME");
+pub const PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[unsafe(no_mangle)]
+pub extern "C" fn obs_module_set_pointer(module: *mut obs_sys::obs_module_t) {
+    unsafe {
+        OBS_MODULE_POINTER = module;
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn obs_module_ver() -> u32 {
+    obs_sys::LIBOBS_API_MAJOR_VER << 24
+        | obs_sys::LIBOBS_API_MINOR_VER << 16
+        | obs_sys::LIBOBS_API_PATCH_VER
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn obs_module_load() -> bool {
+    obs_info!("Running rust plugin {PLUGIN_NAME} version {PLUGIN_VERSION}");
+
+    obs_info!("Registering Raidwide source");
+    unsafe {
+        obs_sys::obs_register_source_s(
+            &raw const source::RAIDWIDE_SOURCE,
+            size_of::<obs_sys::obs_source_info>(),
+        );
+    }
+
+    true
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn obs_module_unload() {
+    obs_info!("Plugin unloaded");
+}
