@@ -18,6 +18,7 @@ fn main() {
         .clang_args([
             #[cfg(windows)]
             "-Wno-error=implicit-function-declaration",
+            "-I/usr/include/obs",
             "-I./obs-studio/libobs/",
             "-I./obs-studio/build_x64/config/",
             "-I./obs-studio/frontend/api/",
