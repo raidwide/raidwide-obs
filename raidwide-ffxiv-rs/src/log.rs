@@ -3,12 +3,12 @@ use std::fmt;
 
 use crate::PLUGIN_NAME;
 
-pub fn obs_log_args(log_level: u32, args: fmt::Arguments) {
+pub fn obs_log_args(log_level: i32, args: fmt::Arguments) {
     let message = format!("[{PLUGIN_NAME}] {args}");
     let message = ffi::CString::new(message.replace('\0', "\\0")).unwrap();
 
     unsafe {
-        obs_sys::blog(log_level.cast_signed(), message.as_ptr());
+        obs_sys::blog(log_level, message.as_ptr());
     }
 }
 

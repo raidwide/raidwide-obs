@@ -1,15 +1,27 @@
 use std::env;
 use std::path;
 
+#[cfg(windows)]
+mod build_win;
+
 fn main() {
     println!("cargo:rerun-if-changed=wrapper.h");
 
     println!("cargo:rustc-link-lib=obs");
     println!("cargo:rustc-link-lib=obs-frontend-api");
 
+    #[cfg(windows)]
+    build_win::find_windows_obs_lib();
+
     let bindings = bindgen::Builder::default()
         .header("wrapper.h")
-        .clang_arg("-I/usr/include/obs")
+        .clang_args([
+            #[cfg(windows)]
+            "-Wno-error=implicit-function-declaration",
+            "-I./obs-studio/libobs/",
+            "-I./obs-studio/build_x64/config/",
+            "-I./obs-studio/frontend/api/",
+        ])
         .allowlist_item("obs_.*")
         .allowlist_item("OBS_.*")
         .allowlist_var("LIBOBS_.*") // LIBOBS_API_MAJOR_VER, LIBOBS_API_MINOR_VER, LIBOBS_API_PATCH_VER
@@ -21,6 +33,10 @@ fn main() {
         .allowlist_function("brealloc")
         .allowlist_function("bfree")
         .allowlist_function("bcrash")
+        .blocklist_type("_bindgen_ty_2")
+        .blocklist_type("_bindgen_ty_3")
+        .blocklist_type("_bindgen_ty_4")
+        .derive_default(true)
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .generate()
         .expect("Unable to generate bindings");
