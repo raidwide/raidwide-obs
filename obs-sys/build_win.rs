@@ -19,7 +19,7 @@ fn generate_def<P: AsRef<OsStr>, Q: AsRef<Path>>(
     assert!(exports.status.success());
     let f = File::create(def_path)?;
     let mut f = BufWriter::new(f);
-    f.write(b"EXPORTS\r\n")?;
+    f.write_all(b"EXPORTS\r\n")?;
     let exports = String::from_utf8_lossy(&exports.stdout);
     let pattern =
         Regex::new(r"(?im)^\s*\d+\s+[0-9a-f]+\s+[0-9a-f]+\s+(\S+)(?:\s+=\s+\S+)?\r?$").unwrap();
