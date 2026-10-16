@@ -3,7 +3,7 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use tungstenite::WebSocket;
 use tungstenite::client::IntoClientRequest;
@@ -20,9 +20,11 @@ const MIN_RETRY_DELAY: Duration = Duration::from_secs(1);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 /// An OverlayPlugin message, with when it was received on OBS's clock
-/// (`os_gettime_ns`), the clock of the frames' render times
+/// (`os_gettime_ns`), the clock of the frames' render times, and on the system
+/// clock, the clock of ACT's log line timestamps
 pub struct Message {
     pub received_ns: u64,
+    pub received_unix_ns: u64,
     pub data: Vec<u8>,
 }
 
@@ -30,6 +32,13 @@ impl Message {
     fn received_now(data: Vec<u8>) -> Self {
         Self {
             received_ns: unsafe { obs_sys::os_gettime_ns() },
+            // 0 (before the epoch) is out of any plausible range, so the
+            // analysis ignores it
+            received_unix_ns: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_or(0, |since_epoch| {
+                    u64::try_from(since_epoch.as_nanos()).unwrap_or(u64::MAX)
+                }),
             data,
         }
     }
@@ -197,7 +206,9 @@ fn run_dummy(sender: &mpsc::Sender<Message>, stop: &AtomicBool) {
     while sleep_unless_stopped(Duration::from_secs(1), stop) {
         obs_debug!("Simulating WebSocket data");
         if sender
-            .send(Message::received_now(br#"{"msgtype":"RaidwideDummy"}"#.to_vec()))
+            .send(Message::received_now(
+                br#"{"msgtype":"RaidwideDummy"}"#.to_vec(),
+            ))
             .is_err()
         {
             break;
