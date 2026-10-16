@@ -57,9 +57,8 @@ impl MessageQueue {
 
     /// The SEI payload of a frame rendered at `render_ns`: the messages
     /// received before it, or all of them when its render time is unknown,
-    /// each one as `{"offset_ns":<received - rendered, <= 0>,
-    /// "received_unix_ns":<received on the system clock>,"message":<raw>}`
-    /// (offset 0 without render time), concatenated
+    /// each one as `{"offset_ns":<received - rendered, <= 0>,"message":<raw>}`
+    /// (0 without render time), concatenated
     fn take_received_before(&mut self, render_ns: Option<u64>) -> Vec<u8> {
         // Received in order, so the pending messages are sorted
         self.pending.extend(self.receiver.try_iter());
@@ -71,13 +70,7 @@ impl MessageQueue {
                 Some(render_ns) => -i64::try_from(render_ns - msg.received_ns).unwrap_or(i64::MAX),
                 None => 0,
             };
-            buffer.extend_from_slice(
-                format!(
-                    r#"{{"offset_ns":{offset_ns},"received_unix_ns":{},"message":"#,
-                    msg.received_unix_ns
-                )
-                .as_bytes(),
-            );
+            buffer.extend_from_slice(format!(r#"{{"offset_ns":{offset_ns},"message":"#).as_bytes());
             buffer.extend_from_slice(&msg.data);
             buffer.push(b'}');
             self.pending.pop_front();
@@ -459,7 +452,6 @@ mod tests {
     fn message(received_ns: u64, data: &[u8]) -> ws::Message {
         ws::Message {
             received_ns,
-            received_unix_ns: 1000 + received_ns,
             data: data.to_vec(),
         }
     }
@@ -475,17 +467,17 @@ mod tests {
         assert_eq!(queue.take_received_before(Some(5)), b"");
         assert_eq!(
             queue.take_received_before(Some(20)),
-            br#"{"offset_ns":-10,"received_unix_ns":1010,"message":1}{"offset_ns":0,"received_unix_ns":1020,"message":2}"#
+            br#"{"offset_ns":-10,"message":1}{"offset_ns":0,"message":2}"#
         );
         sender.send(message(40, b"4")).unwrap();
         assert_eq!(
             queue.take_received_before(Some(35)),
-            br#"{"offset_ns":-5,"received_unix_ns":1030,"message":3}"#
+            br#"{"offset_ns":-5,"message":3}"#
         );
         assert_eq!(queue.take_received_before(Some(35)), b"");
         assert_eq!(
             queue.take_received_before(Some(40)),
-            br#"{"offset_ns":0,"received_unix_ns":1040,"message":4}"#
+            br#"{"offset_ns":0,"message":4}"#
         );
     }
 
@@ -498,7 +490,7 @@ mod tests {
         sender.send(message(20, b"2")).unwrap();
         assert_eq!(
             queue.take_received_before(None),
-            br#"{"offset_ns":0,"received_unix_ns":1010,"message":1}{"offset_ns":0,"received_unix_ns":1020,"message":2}"#
+            br#"{"offset_ns":0,"message":1}{"offset_ns":0,"message":2}"#
         );
     }
 }
