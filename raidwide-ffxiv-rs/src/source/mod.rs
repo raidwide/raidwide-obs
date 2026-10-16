@@ -1,8 +1,9 @@
 use std::ffi;
 use std::mem;
+use std::sync;
 
-use crate::obs_debug;
-use crate::source::output_hook::RaidwideSourceState;
+use crate::catch_panic;
+use crate::ws;
 
 mod output_hook;
 
@@ -23,13 +24,30 @@ pub static mut RAIDWIDE_SOURCE: obs_sys::obs_source_info = obs_sys::obs_source_i
 pub const WS_URL: *const ffi::c_char = c"ws_url".as_ptr();
 pub const TEST_WS_BUTTON: *const ffi::c_char = c"test_ws_button".as_ptr();
 
-#[derive(Default)]
+/// Shared by the UI thread (settings, frontend events) and the outputs'
+/// threads (signals), hence the lock
 struct RaidwideSource {
-    source: *mut obs_sys::obs_source_t,
-    ws_url: String,
+    state: sync::Mutex<State>,
+}
 
-    callback_registered: bool,
-    state: output_hook::RaidwideSourceState,
+#[derive(Default)]
+struct State {
+    ws_url: String,
+    outputs: Vec<output_hook::TrackedOutput>,
+}
+
+impl RaidwideSource {
+    /// # Safety
+    /// `data` must be the pointer returned by `create`, not destroyed yet
+    unsafe fn from_data<'a>(data: *mut ffi::c_void) -> &'a Self {
+        unsafe { data.cast::<Self>().as_ref_unchecked() }
+    }
+
+    fn state(&self) -> sync::MutexGuard<'_, State> {
+        self.state
+            .lock()
+            .unwrap_or_else(sync::PoisonError::into_inner)
+    }
 }
 
 unsafe extern "C" fn get_name(_type_data: *mut ffi::c_void) -> *const ffi::c_char {
@@ -38,46 +56,43 @@ unsafe extern "C" fn get_name(_type_data: *mut ffi::c_void) -> *const ffi::c_cha
 
 unsafe extern "C" fn create(
     settings: *mut obs_sys::obs_data_t,
-    source: *mut obs_sys::obs_source_t,
+    _source: *mut obs_sys::obs_source_t,
 ) -> *mut ffi::c_void {
-    let mut raidwide = Box::new(RaidwideSource::default());
-    raidwide.source = source;
+    // On a panic the source is leaked rather than freed, since callbacks may
+    // already point to it
+    catch_panic("source creation", std::ptr::null_mut(), || {
+        let raidwide = Box::new(RaidwideSource {
+            state: sync::Mutex::new(State::default()),
+        });
 
-    let data = Box::into_raw(raidwide).cast();
-    unsafe { update(data, settings) };
-    data
+        let data = Box::into_raw(raidwide).cast();
+        unsafe {
+            update(data, settings);
+            obs_sys::obs_frontend_add_event_callback(Some(output_hook::frontend_event_cb), data);
+        }
+        // Hooks the outputs already active, e.g. when the source is added
+        // during a recording, and follows the existing ones from their next start
+        output_hook::track_outputs(data);
+        data
+    })
 }
 
 unsafe extern "C" fn destroy(data: *mut ffi::c_void) {
-    let mut source: Box<RaidwideSource> = unsafe { Box::from_raw(data.cast()) };
-
-    if source.callback_registered {
+    catch_panic("source destruction", (), || {
         unsafe {
             obs_sys::obs_frontend_remove_event_callback(Some(output_hook::frontend_event_cb), data);
         }
-    }
-
-    if matches!(source.state, RaidwideSourceState::Running { .. }) {
-        source.state.stop(data);
-    }
-
-    drop(source)
+        output_hook::untrack_outputs(data);
+        drop(unsafe { Box::from_raw(data.cast::<RaidwideSource>()) });
+    })
 }
 
 unsafe extern "C" fn update(data: *mut ffi::c_void, settings: *mut obs_sys::obs_data_t) {
-    let source = unsafe { data.cast::<RaidwideSource>().as_mut_unchecked() };
-    source.ws_url = unsafe { ffi::CStr::from_ptr(obs_sys::obs_data_get_string(settings, WS_URL)) }
-        .to_str()
-        .unwrap()
-        .to_string();
-
-    if !source.callback_registered {
-        obs_debug!("Registering frontend callback event");
-        unsafe {
-            obs_sys::obs_frontend_add_event_callback(Some(output_hook::frontend_event_cb), data);
-        }
-        source.callback_registered = true;
-    }
+    catch_panic("source update", (), || {
+        let source = unsafe { RaidwideSource::from_data(data) };
+        let ws_url = unsafe { ffi::CStr::from_ptr(obs_sys::obs_data_get_string(settings, WS_URL)) };
+        source.state().ws_url = ws_url.to_string_lossy().into_owned();
+    })
 }
 
 unsafe extern "C" fn get_properties(data: *mut ffi::c_void) -> *mut obs_sys::obs_properties_t {
@@ -115,12 +130,18 @@ unsafe extern "C" fn test_ws_button_callback(
     property: *mut obs_sys::obs_property,
     data: *mut ffi::c_void,
 ) -> bool {
-    let source = unsafe { data.cast::<RaidwideSource>().as_mut_unchecked() };
-    let res = match tungstenite::client::connect(&source.ws_url) {
-        // TOOD: close connection
-        Ok(_) => c"OK".as_ptr(),
-        Err(_) => c"KO".as_ptr(),
-    };
-    unsafe { obs_sys::obs_property_set_description(property, res) };
-    true
+    catch_panic("test connection button", false, || {
+        let source = unsafe { RaidwideSource::from_data(data) };
+        let ws_url = source.state().ws_url.clone();
+        let res = match ws::connect(&ws_url) {
+            Ok(mut ws) => {
+                let _ = ws.close(None);
+                let _ = ws.flush();
+                c"OK".as_ptr()
+            }
+            Err(_) => c"KO".as_ptr(),
+        };
+        unsafe { obs_sys::obs_property_set_description(property, res) };
+        true
+    })
 }
