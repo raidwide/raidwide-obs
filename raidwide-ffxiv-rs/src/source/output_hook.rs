@@ -1,14 +1,16 @@
+use std::collections::VecDeque;
 use std::ffi;
 use std::mem;
 use std::ptr;
 use std::slice;
-use std::sync::mpsc;
+use std::sync::{self, mpsc};
 
 use crate::calldata;
+use crate::catch_panic;
 use crate::sei;
 use crate::source::RaidwideSource;
 use crate::ws;
-use crate::{obs_debug, obs_info};
+use crate::{obs_debug, obs_info, obs_warning};
 
 /// An output whose activate and deactivate signals the source is connected to
 pub struct TrackedOutput {
@@ -24,8 +26,46 @@ pub struct TrackedOutput {
 /// player, zone), whenever it starts. The packet callback's parameter points
 /// to it, hence the box
 struct OutputHook {
-    receiver: mpsc::Receiver<Vec<u8>>,
+    /// Only used by the packet callback, which OBS doesn't run concurrently
+    /// for an output, so the lock is never contended
+    messages: sync::Mutex<MessageQueue>,
     _connection: ws::Connection,
+}
+
+/// An output's messages, waiting for the first frame rendered after them.
+/// A packet reaches the packet callback well after its frame was rendered
+/// (encoder lookahead, B-frame reordering, interleaving with audio, stream
+/// delay), so attaching every message received so far to it would place them
+/// too early in the video.
+struct MessageQueue {
+    receiver: mpsc::Receiver<ws::Message>,
+    pending: VecDeque<ws::Message>,
+}
+
+impl MessageQueue {
+    fn new(receiver: mpsc::Receiver<ws::Message>) -> Self {
+        Self {
+            receiver,
+            pending: VecDeque::new(),
+        }
+    }
+
+    /// The concatenated messages received before a frame rendered at
+    /// `render_ns`, or all of them when the frame's render time is unknown
+    fn take_received_before(&mut self, render_ns: Option<u64>) -> Vec<u8> {
+        // Received in order, so the pending messages are sorted
+        self.pending.extend(self.receiver.try_iter());
+
+        let mut buffer = vec![];
+        while let Some(msg) = self.pending.front() {
+            if render_ns.is_some_and(|render_ns| msg.received_ns > render_ns) {
+                break;
+            }
+            buffer.extend_from_slice(&msg.data);
+            self.pending.pop_front();
+        }
+        buffer
+    }
 }
 
 impl TrackedOutput {
@@ -161,7 +201,7 @@ fn hook_output(source: &RaidwideSource, output: *mut obs_sys::obs_output_t, rest
     );
     let (sender, receiver) = mpsc::channel();
     let hook = Box::new(OutputHook {
-        receiver,
+        messages: sync::Mutex::new(MessageQueue::new(receiver)),
         _connection: ws::Connection::spawn(ws_url, sender),
     });
     unsafe {
@@ -253,7 +293,9 @@ pub extern "C" fn frontend_event_cb(
         || event == obs_sys::obs_frontend_event_OBS_FRONTEND_EVENT_RECORDING_STARTED
         || event == obs_sys::obs_frontend_event_OBS_FRONTEND_EVENT_REPLAY_BUFFER_STARTED
     {
-        track_outputs(private_data);
+        catch_panic("frontend event callback", (), || {
+            track_outputs(private_data)
+        });
     }
 }
 
@@ -276,31 +318,49 @@ extern "C" fn collect_output_cb(
 }
 
 extern "C" fn output_activate_cb(data: *mut ffi::c_void, callback_data: *mut obs_sys::calldata_t) {
-    let source = unsafe { RaidwideSource::from_data(data) };
-    let output =
-        unsafe { calldata::calldata_ptr(callback_data, c"output").cast::<obs_sys::obs_output_t>() };
-    hook_output(source, output, true);
+    catch_panic("output activate callback", (), || {
+        let source = unsafe { RaidwideSource::from_data(data) };
+        let output = unsafe {
+            calldata::calldata_ptr(callback_data, c"output").cast::<obs_sys::obs_output_t>()
+        };
+        hook_output(source, output, true);
+    })
 }
 
 extern "C" fn output_deactivate_cb(
     data: *mut ffi::c_void,
     callback_data: *mut obs_sys::calldata_t,
 ) {
-    let source = unsafe { RaidwideSource::from_data(data) };
-    let output =
-        unsafe { calldata::calldata_ptr(callback_data, c"output").cast::<obs_sys::obs_output_t>() };
-    unhook_output(source, output);
+    catch_panic("output deactivate callback", (), || {
+        let source = unsafe { RaidwideSource::from_data(data) };
+        let output = unsafe {
+            calldata::calldata_ptr(callback_data, c"output").cast::<obs_sys::obs_output_t>()
+        };
+        unhook_output(source, output);
+    })
 }
 
-// On linux the encoder_packet has a `ref_count: long` value allocated in
+// The encoder_packet has a `ref_count: long` value allocated in
 // front of pkt.
-// TODO: check why this is not the case on windows.
 const ENCODER_PACKET_ALLOC_OFFSET: usize = size_of::<ffi::c_long>();
 
 extern "C" fn packet_cb(
     output: *mut obs_sys::obs_output_t,
     pkt_ref: *mut obs_sys::encoder_packet,
-    _pkt_time: *mut obs_sys::encoder_packet_time,
+    pkt_time: *mut obs_sys::encoder_packet_time,
+    param: *mut ffi::c_void,
+) {
+    catch_panic("packet callback", (), || unsafe {
+        add_sei(output, pkt_ref, pkt_time, param)
+    })
+}
+
+/// # Safety
+/// The packet callback's arguments, `param` pointing to the output's hook
+unsafe fn add_sei(
+    output: *mut obs_sys::obs_output_t,
+    pkt_ref: *mut obs_sys::encoder_packet,
+    pkt_time: *mut obs_sys::encoder_packet_time,
     param: *mut ffi::c_void,
 ) {
     let mut pkt = unsafe { pkt_ref.as_mut_unchecked() }.to_owned();
@@ -313,7 +373,7 @@ extern "C" fn packet_cb(
         return;
     }
 
-    let receiver = &unsafe { param.cast::<OutputHook>().as_ref_unchecked() }.receiver;
+    let hook = unsafe { param.cast::<OutputHook>().as_ref_unchecked() };
     let output_name = unsafe { ffi::CStr::from_ptr(obs_sys::obs_output_get_name(output)) };
     obs_debug!(
         "Received packet of size {} on output {}",
@@ -321,10 +381,13 @@ extern "C" fn packet_cb(
         output_name.to_string_lossy(),
     );
 
-    let mut buffer = vec![];
-    while let Ok(msg) = receiver.try_recv() {
-        buffer.extend_from_slice(&msg)
-    }
+    // OBS matches the timing to the packet by PTS, it is missing if that fails
+    let render_ns = unsafe { pkt_time.as_ref() }.map(|time| time.cts);
+    let buffer = hook
+        .messages
+        .lock()
+        .unwrap_or_else(sync::PoisonError::into_inner)
+        .take_received_before(render_ns);
 
     if buffer.is_empty() {
         return;
@@ -332,6 +395,11 @@ extern "C" fn packet_cb(
 
     let sei_data = sei::SeiUserDataUnregistered::new(&sei::RAIDWIDE_UUID, &buffer);
     let sei_size = sei_data.encoded_h264_size();
+    let mut sei_nal = vec![0; sei_size];
+    if let Err(e) = sei_data.encode_h264(&mut sei_nal) {
+        obs_warning!("Failed to encode the SEI, dropping its data: {e}");
+        return;
+    }
 
     // to properly handle ref_count on encoder_packet, we create a new
     // encoder_packet with a ref_count of 1 with our sei data prepended to the
@@ -345,11 +413,8 @@ extern "C" fn packet_cb(
 
     new_pkt_data[0..ENCODER_PACKET_ALLOC_OFFSET]
         .copy_from_slice(&ffi::c_long::from(1).to_ne_bytes());
-    sei_data
-        .encode_h264(
-            &mut new_pkt_data[ENCODER_PACKET_ALLOC_OFFSET..ENCODER_PACKET_ALLOC_OFFSET + sei_size],
-        )
-        .unwrap();
+    new_pkt_data[ENCODER_PACKET_ALLOC_OFFSET..ENCODER_PACKET_ALLOC_OFFSET + sei_size]
+        .copy_from_slice(&sei_nal);
     new_pkt_data[ENCODER_PACKET_ALLOC_OFFSET + sei_size..].copy_from_slice(old_pkt_data);
 
     unsafe { obs_sys::obs_encoder_packet_release(pkt_ref) };
@@ -367,4 +432,42 @@ extern "C" fn packet_cb(
     }
 
     obs_info!("Appended {} bytes of SEI data", sei_size);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message(received_ns: u64, data: &[u8]) -> ws::Message {
+        ws::Message {
+            received_ns,
+            data: data.to_vec(),
+        }
+    }
+
+    #[test]
+    fn takes_the_messages_received_before_the_frame() {
+        let (sender, receiver) = mpsc::channel();
+        let mut queue = MessageQueue::new(receiver);
+        sender.send(message(10, b"a")).unwrap();
+        sender.send(message(20, b"b")).unwrap();
+        sender.send(message(30, b"c")).unwrap();
+
+        assert_eq!(queue.take_received_before(Some(5)), b"");
+        assert_eq!(queue.take_received_before(Some(20)), b"ab");
+        sender.send(message(40, b"d")).unwrap();
+        assert_eq!(queue.take_received_before(Some(35)), b"c");
+        assert_eq!(queue.take_received_before(Some(35)), b"");
+        assert_eq!(queue.take_received_before(Some(40)), b"d");
+    }
+
+    #[test]
+    fn takes_everything_without_render_time() {
+        let (sender, receiver) = mpsc::channel();
+        let mut queue = MessageQueue::new(receiver);
+        sender.send(message(10, b"a")).unwrap();
+        assert_eq!(queue.take_received_before(Some(5)), b"");
+        sender.send(message(20, b"b")).unwrap();
+        assert_eq!(queue.take_received_before(None), b"ab");
+    }
 }

@@ -4,10 +4,29 @@ mod sei;
 mod source;
 mod ws;
 
+use std::panic;
+
 static mut OBS_MODULE_POINTER: *mut obs_sys::obs_module_t = std::ptr::null_mut();
 
 pub const PLUGIN_NAME: &str = env!("CARGO_PKG_NAME");
 pub const PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Run an OBS callback's body, logging a panic instead of letting it abort OBS
+/// (a panic can't unwind out of an `extern "C"` function)
+pub fn catch_panic<T>(callback: &str, default: T, body: impl FnOnce() -> T) -> T {
+    match panic::catch_unwind(panic::AssertUnwindSafe(body)) {
+        Ok(value) => value,
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("unknown cause");
+            obs_error!("Panic in the {callback}: {message}");
+            default
+        }
+    }
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn obs_module_set_pointer(module: *mut obs_sys::obs_module_t) {

@@ -6,7 +6,11 @@ edition = "2024"
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+# Without OverlayPlugin, inject a fixed payload every second instead of
+# retrying to connect
+dummy-producer = []
+
 [dependencies]
-bus = "2.4.1"
 obs-sys = { path = "../obs-sys" }
 tungstenite = "0.29.0"
