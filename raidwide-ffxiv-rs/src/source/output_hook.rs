@@ -1,381 +1,295 @@
-use std::collections::HashMap;
-use std::collections::HashSet;
 use std::ffi;
 use std::mem;
 use std::ptr;
 use std::slice;
-use std::sync;
-use std::sync::Arc;
-use std::thread;
-use std::time;
+use std::sync::mpsc;
 
-use crate::broadcast;
 use crate::calldata;
 use crate::sei;
 use crate::source::RaidwideSource;
-use crate::{obs_debug, obs_info, obs_warning};
+use crate::ws;
+use crate::{obs_debug, obs_info};
 
-pub type Msg = Arc<Vec<u8>>;
-
-#[derive(Default)]
-pub enum RaidwideSourceState {
-    #[default]
-    Idle,
-    Running {
-        thread_handle: thread::JoinHandle<()>,
-        start_event_count: usize,
-        consumer: broadcast::ConsumerGenerator<Msg>,
-        // TODO: thread-safe?
-        receivers: HashMap<ffi::CString, sync::mpsc::Receiver<Msg>>,
-        signal_subscribed: HashSet<ffi::CString>,
-    },
+/// An output whose activate and deactivate signals the source is connected to
+pub struct TrackedOutput {
+    /// Weak reference: OBS destroys and recreates outputs (e.g. after a
+    /// settings change), and a new one can reuse a destroyed one's address
+    weak: *mut obs_sys::obs_weak_output_t,
+    /// Set while the output is active
+    hook: Option<Box<OutputHook>>,
 }
 
-impl RaidwideSourceState {
-    pub fn start(&mut self, data: *mut ffi::c_void) {
-        obs_debug!("Starting raidwide");
-        assert!(matches!(self, Self::Idle));
+/// The state of an active output: its own OverlayPlugin connection, so that
+/// it gets the messages OverlayPlugin sends when a connection opens (primary
+/// player, zone), whenever it starts. The packet callback's parameter points
+/// to it, hence the box
+struct OutputHook {
+    receiver: mpsc::Receiver<Vec<u8>>,
+    _connection: ws::Connection,
+}
 
-        let source = unsafe { data.cast::<RaidwideSource>().as_mut_unchecked() };
-
-        let (mut producer, consumer) = broadcast::broadcast_channel();
-        let thread_handle = thread::spawn({
-            let url = source.ws_url.clone();
-            move || {
-                ws_thread(&mut producer, &url);
-            }
-        });
-
-        *self = Self::Running {
-            consumer,
-            receivers: HashMap::new(),
-            signal_subscribed: HashSet::new(),
-            thread_handle,
-            start_event_count: 1,
-        };
-
-        obs_debug!("Raidwide started");
-    }
-
-    pub fn stop(&mut self, _data: *mut ffi::c_void) {
-        obs_debug!("Stopping raidwide");
-        assert!(matches!(self, Self::Running { .. }));
-
-        let state = mem::replace(self, Self::Idle);
-
-        match state {
-            Self::Idle => panic!("State management error"),
-            Self::Running {
-                mut consumer,
-                mut receivers,
-                thread_handle,
-                ..
-            } => {
-                consumer.close();
-                thread_handle.join().unwrap();
-
-                for (output_name, receiver) in receivers.iter_mut() {
-                    let output = unsafe { obs_sys::obs_get_output_by_name(output_name.as_ptr()) };
-                    if output.is_null() {
-                        obs_warning!(
-                            "Cannot remove callback for {} because no output with that name were found",
-                            output_name.to_string_lossy()
-                        );
-                        continue;
-                    }
-
-                    unsafe {
-                        obs_sys::obs_output_remove_packet_callback(
-                            output,
-                            Some(packet_cb),
-                            ptr::from_mut(receiver).cast(),
-                        );
-                        obs_sys::obs_output_release(output);
-                    }
-                }
-            }
-        }
-
-        obs_debug!("Raidwide stopped");
-    }
-
-    pub fn try_start(&mut self, data: *mut ffi::c_void) {
-        // TODO: run enum output callbacks in case new output have been created
-        match self {
-            Self::Idle => {
-                self.start(data);
-                obs_info!("Hooking outputs");
-                unsafe { obs_sys::obs_enum_outputs(Some(enum_output_cb), data) };
-            }
-            Self::Running {
-                start_event_count, ..
-            } => *start_event_count += 1,
+impl TrackedOutput {
+    fn new(output: *mut obs_sys::obs_output_t) -> Self {
+        Self {
+            weak: unsafe { obs_sys::obs_output_get_weak_output(output) },
+            hook: None,
         }
     }
 
-    pub fn try_stop(&mut self, data: *mut ffi::c_void) {
-        match self {
-            Self::Running {
-                start_event_count, ..
-            } => {
-                *start_event_count -= 1;
-                if *start_event_count == 0 {
-                    self.stop(data);
-                }
-            }
-            Self::Idle => obs_warning!("stop was called more than start"),
+    fn is(&self, output: *mut obs_sys::obs_output_t) -> bool {
+        unsafe { obs_sys::obs_weak_output_references_output(self.weak, output) }
+    }
+
+    /// A strong reference to the output, null if it was destroyed
+    fn upgrade(&self) -> *mut obs_sys::obs_output_t {
+        unsafe { obs_sys::obs_weak_output_get_output(self.weak) }
+    }
+
+    fn is_alive(&self) -> bool {
+        let output = self.upgrade();
+        unsafe { obs_sys::obs_output_release(output) };
+        !output.is_null()
+    }
+}
+
+impl Drop for TrackedOutput {
+    fn drop(&mut self) {
+        unsafe { obs_sys::obs_weak_output_release(self.weak) };
+    }
+}
+
+// Locking: OBS holds an output's signal mutex while running its signal
+// callbacks, which lock the source's state, so the state must not be locked
+// while connecting or disconnecting signals. The packet callback doesn't lock
+// the state, so (un)registering packet callbacks with the state locked is fine.
+
+/// Connect to the signals of the outputs not tracked yet, and hook the active
+/// ones. Outputs are only enumerated when something starts, so the ones
+/// created since the last enumeration are picked up then.
+pub fn track_outputs(data: *mut ffi::c_void) {
+    let source = unsafe { RaidwideSource::from_data(data) };
+
+    // Forget the outputs OBS destroyed, their signals and packet callbacks
+    // went with them. Their connections are stopped outside of the lock.
+    let destroyed: Vec<_> = source
+        .state()
+        .outputs
+        .extract_if(.., |tracked| !tracked.is_alive())
+        .collect();
+    drop(destroyed);
+
+    let mut outputs: Vec<*mut obs_sys::obs_output_t> = vec![];
+    unsafe {
+        obs_sys::obs_enum_outputs(Some(collect_output_cb), ptr::from_mut(&mut outputs).cast())
+    };
+
+    for output in outputs {
+        track_output(source, output, data);
+        unsafe { obs_sys::obs_output_release(output) };
+    }
+}
+
+fn track_output(
+    source: &RaidwideSource,
+    output: *mut obs_sys::obs_output_t,
+    data: *mut ffi::c_void,
+) {
+    {
+        let mut state = source.state();
+        if !state.outputs.iter().any(|tracked| tracked.is(output)) {
+            obs_info!("Adding signal handlers for output {}", output_name(output));
+            state.outputs.push(TrackedOutput::new(output));
+            drop(state);
+            unsafe { connect_signals(output, data) };
         }
     }
 
-    pub fn register_output_hook(&mut self, output: *mut obs_sys::obs_output_t) {
-        let output_name = unsafe { ffi::CStr::from_ptr(obs_sys::obs_output_get_name(output)) };
+    // Covers outputs that were active before their signals were connected
+    if unsafe { obs_sys::obs_output_active(output) } {
+        hook_output(source, output, false);
+    }
+}
+
+/// Stop tracking every output, for the source's destruction
+pub fn untrack_outputs(data: *mut ffi::c_void) {
+    let source = unsafe { RaidwideSource::from_data(data) };
+
+    // Signal callbacks running meanwhile find nothing to hook or unhook
+    let tracked_outputs = mem::take(&mut source.state().outputs);
+    for mut tracked in tracked_outputs {
+        let output = tracked.upgrade();
+        if output.is_null() {
+            continue;
+        }
+
+        // Returns once the signal callbacks in progress have finished
+        unsafe { disconnect_signals(output, data) };
+        if let Some(hook) = tracked.hook.take() {
+            unsafe { remove_packet_callback(output, &hook) };
+        }
+        unsafe { obs_sys::obs_output_release(output) };
+    }
+}
+
+/// Start the output's connection and packet callback. `restart` replaces an
+/// existing hook: an activation starts a new recording or stream, which needs
+/// a new connection to get OverlayPlugin's initial messages
+fn hook_output(source: &RaidwideSource, output: *mut obs_sys::obs_output_t, restart: bool) {
+    let mut state = source.state();
+    let ws_url = state.ws_url.clone();
+    let Some(tracked) = state.outputs.iter_mut().find(|tracked| tracked.is(output)) else {
         obs_debug!(
-            "Registering packet callback for output {}",
-            output_name.to_string_lossy()
+            "Output {} is not tracked, not hooking it",
+            output_name(output)
         );
+        return;
+    };
 
-        let (consumer, receivers) = match self {
-            RaidwideSourceState::Running {
-                consumer,
-                receivers,
-                ..
-            } => (consumer, receivers),
-            _ => {
-                obs_warning!("Raidwide is not running");
-                return;
-            }
-        };
-
-        if receivers
-            .insert(output_name.to_owned(), consumer.subscribe())
-            .is_some()
-        {
-            obs_warning!(
-                "Registering packet callback for output {}, but state already existed with the same name",
-                output_name.to_string_lossy()
-            );
-        }
-
-        let receiver = receivers.get_mut(output_name).unwrap();
-        unsafe {
-            obs_sys::obs_output_add_packet_callback(
-                output,
-                Some(packet_cb),
-                ptr::from_mut(receiver).cast(),
-            )
-        };
+    if tracked.hook.is_some() && !restart {
+        return;
+    }
+    // Dropped (which stops its connection) once the state is unlocked
+    let previous = tracked.hook.take();
+    if let Some(hook) = &previous {
+        obs_debug!("Replacing the hook of output {}", output_name(output));
+        unsafe { remove_packet_callback(output, hook) };
     }
 
-    pub fn unregister_output_hook(&mut self, output: *mut obs_sys::obs_output_t) {
-        let output_name = unsafe { ffi::CStr::from_ptr(obs_sys::obs_output_get_name(output)) };
+    obs_debug!(
+        "Registering packet callback for output {}",
+        output_name(output)
+    );
+    let (sender, receiver) = mpsc::channel();
+    let hook = Box::new(OutputHook {
+        receiver,
+        _connection: ws::Connection::spawn(ws_url, sender),
+    });
+    unsafe {
+        obs_sys::obs_output_add_packet_callback(
+            output,
+            Some(packet_cb),
+            ptr::from_ref::<OutputHook>(&hook).cast_mut().cast(),
+        )
+    };
+    tracked.hook = Some(hook);
+    drop(state);
+    drop(previous);
+}
 
+fn unhook_output(source: &RaidwideSource, output: *mut obs_sys::obs_output_t) {
+    let hook = source
+        .state()
+        .outputs
+        .iter_mut()
+        .find(|tracked| tracked.is(output))
+        .and_then(|tracked| tracked.hook.take());
+
+    if let Some(hook) = hook {
         obs_debug!(
             "Unregistering packet callback for output {}",
-            output_name.to_string_lossy()
+            output_name(output)
         );
-
-        let receivers = match self {
-            RaidwideSourceState::Running { receivers, .. } => receivers,
-            _ => {
-                obs_warning!("Raidwide is not running");
-                return;
-            }
-        };
-
-        if !receivers.contains_key(output_name) {
-            obs_warning!(
-                "Packet callbacks were already unregistered for output {}, ignoring",
-                output_name.to_string_lossy()
-            );
-            return;
-        }
-
-        let receiver = receivers.get_mut(output_name).unwrap();
-        unsafe {
-            obs_sys::obs_output_remove_packet_callback(
-                output,
-                Some(packet_cb),
-                ptr::from_mut(receiver).cast(),
-            )
-        };
-        receivers.remove(output_name).unwrap();
-    }
-
-    pub fn unregister_output_signal_hooks(
-        &mut self,
-        output: *mut obs_sys::obs_output_t,
-        data: *mut ffi::c_void,
-    ) {
-        let output_name = unsafe { ffi::CStr::from_ptr(obs_sys::obs_output_get_name(output)) };
-        obs_debug!(
-            "Unregistering signal callbacks for output {}",
-            output_name.to_string_lossy()
-        );
-
-        self.unregister_output_hook(output);
-
-        let signal_subscribed = match self {
-            RaidwideSourceState::Running {
-                signal_subscribed, ..
-            } => signal_subscribed,
-            _ => {
-                obs_warning!("Raidwide is not running");
-                return;
-            }
-        };
-
-        let signal_handler = unsafe { obs_sys::obs_output_get_signal_handler(output) };
-        unsafe {
-            obs_sys::signal_handler_disconnect(
-                signal_handler,
-                c"activate".as_ptr(),
-                Some(output_activate_cb),
-                data,
-            );
-            obs_sys::signal_handler_disconnect(
-                signal_handler,
-                c"deactivate".as_ptr(),
-                Some(output_deactivate_cb),
-                data,
-            );
-            obs_sys::signal_handler_disconnect(
-                signal_handler,
-                c"stop".as_ptr(),
-                Some(output_stop_cb),
-                data,
-            );
-        };
-        signal_subscribed.remove(output_name);
+        // Returns once a packet callback in progress has finished, so the
+        // hook can be dropped (which stops its connection) afterwards
+        unsafe { remove_packet_callback(output, &hook) };
     }
 }
 
-fn ws_thread(prod: &mut broadcast::Producer<Msg>, url: &str) {
-    match tungstenite::connect(url) {
-        Ok((mut ws, _res)) => {
-            obs_info!("Connected to {url}");
-            loop {
-                let msg = match ws.read() {
-                    Ok(msg) => msg,
-                    Err(e) => {
-                        obs_warning!("Error reading from WebSocket: {e}");
-                        break;
-                    }
-                };
-                if let Err(_) = prod.send(Arc::new(msg.into_data().into())) {
-                    break;
-                }
-            }
-        }
-        Err(e) => {
-            obs_warning!("Failed to connect to {url}, falling back to dummy debug producer: {e}");
-            loop {
-                thread::sleep(time::Duration::from_secs(1));
-                obs_debug!("Simulating WebSocket data");
-                if let Err(_) = prod.send(Arc::new(b"SEI RAIDWIDE".to_vec())) {
-                    break;
-                }
-            }
-        }
+unsafe fn remove_packet_callback(output: *mut obs_sys::obs_output_t, hook: &OutputHook) {
+    unsafe {
+        obs_sys::obs_output_remove_packet_callback(
+            output,
+            Some(packet_cb),
+            ptr::from_ref(hook).cast_mut().cast(),
+        )
+    };
+}
+
+unsafe fn connect_signals(output: *mut obs_sys::obs_output_t, data: *mut ffi::c_void) {
+    let signal_handler = unsafe { obs_sys::obs_output_get_signal_handler(output) };
+    unsafe {
+        obs_sys::signal_handler_connect(
+            signal_handler,
+            c"activate".as_ptr(),
+            Some(output_activate_cb),
+            data,
+        );
+        obs_sys::signal_handler_connect(
+            signal_handler,
+            c"deactivate".as_ptr(),
+            Some(output_deactivate_cb),
+            data,
+        );
     }
-    obs_debug!("WebSocket thread finished");
+}
+
+unsafe fn disconnect_signals(output: *mut obs_sys::obs_output_t, data: *mut ffi::c_void) {
+    let signal_handler = unsafe { obs_sys::obs_output_get_signal_handler(output) };
+    unsafe {
+        obs_sys::signal_handler_disconnect(
+            signal_handler,
+            c"activate".as_ptr(),
+            Some(output_activate_cb),
+            data,
+        );
+        obs_sys::signal_handler_disconnect(
+            signal_handler,
+            c"deactivate".as_ptr(),
+            Some(output_deactivate_cb),
+            data,
+        );
+    }
+}
+
+fn output_name<'a>(output: *mut obs_sys::obs_output_t) -> std::borrow::Cow<'a, str> {
+    unsafe { ffi::CStr::from_ptr(obs_sys::obs_output_get_name(output)) }.to_string_lossy()
 }
 
 pub extern "C" fn frontend_event_cb(
     event: obs_sys::obs_frontend_event,
     private_data: *mut ffi::c_void,
 ) {
-    let source = unsafe { private_data.cast::<RaidwideSource>().as_mut_unchecked() };
-
     if event == obs_sys::obs_frontend_event_OBS_FRONTEND_EVENT_STREAMING_STARTED
         || event == obs_sys::obs_frontend_event_OBS_FRONTEND_EVENT_RECORDING_STARTED
+        || event == obs_sys::obs_frontend_event_OBS_FRONTEND_EVENT_REPLAY_BUFFER_STARTED
     {
-        source.state.try_start(private_data);
-    }
-
-    if event == obs_sys::obs_frontend_event_OBS_FRONTEND_EVENT_STREAMING_STOPPED
-        || event == obs_sys::obs_frontend_event_OBS_FRONTEND_EVENT_RECORDING_STOPPED
-    {
-        source.state.try_stop(private_data);
+        track_outputs(private_data);
     }
 }
 
-extern "C" fn enum_output_cb(data: *mut ffi::c_void, output: *mut obs_sys::obs_output_t) -> bool {
-    let output_name = unsafe { ffi::CStr::from_ptr(obs_sys::obs_output_get_name(output)) };
-    let signal_handler = unsafe { obs_sys::obs_output_get_signal_handler(output) };
-
-    let source = unsafe { data.cast::<RaidwideSource>().as_mut_unchecked() };
-
-    match &mut source.state {
-        RaidwideSourceState::Idle => {
-            obs_warning!("Enumerating outputs while raidwide is not running");
-            return false;
-        }
-        RaidwideSourceState::Running {
-            signal_subscribed, ..
-        } => {
-            if signal_subscribed.contains(output_name) {
-                obs_debug!("Duplicate output signal subscription detected, ignoring");
-                return true;
-            }
-
-            obs_info!(
-                "Adding signal handlers for output {}",
-                output_name.to_string_lossy()
-            );
-
-            signal_subscribed.insert(output_name.to_owned());
-            unsafe {
-                obs_sys::signal_handler_connect(
-                    signal_handler,
-                    c"activate".as_ptr(),
-                    Some(output_activate_cb),
-                    data,
-                );
-                obs_sys::signal_handler_connect(
-                    signal_handler,
-                    c"deactivate".as_ptr(),
-                    Some(output_deactivate_cb),
-                    data,
-                );
-                obs_sys::signal_handler_connect(
-                    signal_handler,
-                    c"stop".as_ptr(),
-                    Some(output_stop_cb),
-                    data,
-                );
-
-                if obs_sys::obs_output_active(output) {
-                    source.state.register_output_hook(output);
-                }
-            };
-        }
+/// Collects a strong reference to every output, so they are tracked outside
+/// of the outputs' list lock
+extern "C" fn collect_output_cb(
+    param: *mut ffi::c_void,
+    output: *mut obs_sys::obs_output_t,
+) -> bool {
+    let outputs = unsafe {
+        param
+            .cast::<Vec<*mut obs_sys::obs_output_t>>()
+            .as_mut_unchecked()
+    };
+    let output = unsafe { obs_sys::obs_output_get_ref(output) };
+    if !output.is_null() {
+        outputs.push(output);
     }
-
     true
 }
 
 extern "C" fn output_activate_cb(data: *mut ffi::c_void, callback_data: *mut obs_sys::calldata_t) {
-    let source = unsafe { data.cast::<RaidwideSource>().as_mut_unchecked() };
+    let source = unsafe { RaidwideSource::from_data(data) };
     let output =
         unsafe { calldata::calldata_ptr(callback_data, c"output").cast::<obs_sys::obs_output_t>() };
-    source.state.register_output_hook(output);
+    hook_output(source, output, true);
 }
 
 extern "C" fn output_deactivate_cb(
     data: *mut ffi::c_void,
     callback_data: *mut obs_sys::calldata_t,
 ) {
-    let source = unsafe { data.cast::<RaidwideSource>().as_mut_unchecked() };
+    let source = unsafe { RaidwideSource::from_data(data) };
     let output =
         unsafe { calldata::calldata_ptr(callback_data, c"output").cast::<obs_sys::obs_output_t>() };
-    source.state.unregister_output_hook(output);
-}
-
-extern "C" fn output_stop_cb(data: *mut ffi::c_void, callback_data: *mut obs_sys::calldata_t) {
-    let source = unsafe { data.cast::<RaidwideSource>().as_mut_unchecked() };
-    let output =
-        unsafe { calldata::calldata_ptr(callback_data, c"output").cast::<obs_sys::obs_output_t>() };
-    source.state.unregister_output_signal_hooks(output, data);
+    unhook_output(source, output);
 }
 
 // On linux the encoder_packet has a `ref_count: long` value allocated in
@@ -399,7 +313,7 @@ extern "C" fn packet_cb(
         return;
     }
 
-    let receiver = unsafe { param.cast::<sync::mpsc::Receiver<Msg>>().as_mut_unchecked() };
+    let receiver = &unsafe { param.cast::<OutputHook>().as_ref_unchecked() }.receiver;
     let output_name = unsafe { ffi::CStr::from_ptr(obs_sys::obs_output_get_name(output)) };
     obs_debug!(
         "Received packet of size {} on output {}",

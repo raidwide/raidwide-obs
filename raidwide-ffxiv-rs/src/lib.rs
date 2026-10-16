@@ -1,8 +1,8 @@
-mod broadcast;
 mod calldata;
 mod log;
 mod sei;
 mod source;
+mod ws;
 
 static mut OBS_MODULE_POINTER: *mut obs_sys::obs_module_t = std::ptr::null_mut();
 
