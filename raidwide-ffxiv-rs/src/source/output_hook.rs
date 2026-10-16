@@ -37,6 +37,11 @@ struct OutputHook {
 /// (encoder lookahead, B-frame reordering, interleaving with audio, stream
 /// delay), so attaching every message received so far to it would place them
 /// too early in the video.
+///
+/// Packets also come in decode order: a P-frame comes before the B-frames
+/// displayed ahead of it, and takes the messages received before them too.
+/// So each message goes with its offset to the render of the frame carrying
+/// it, for the analysis to place it at that frame's PTS plus the offset.
 struct MessageQueue {
     receiver: mpsc::Receiver<ws::Message>,
     pending: VecDeque<ws::Message>,
@@ -50,18 +55,24 @@ impl MessageQueue {
         }
     }
 
-    /// The concatenated messages received before a frame rendered at
-    /// `render_ns`, or all of them when the frame's render time is unknown
+    /// The SEI payload of a frame rendered at `render_ns`: the messages
+    /// received before it, or all of them when its render time is unknown,
+    /// each one as `{"offset_ns":<received - rendered, <= 0>,"message":<raw>}`
+    /// (0 without render time), concatenated
     fn take_received_before(&mut self, render_ns: Option<u64>) -> Vec<u8> {
         // Received in order, so the pending messages are sorted
         self.pending.extend(self.receiver.try_iter());
 
         let mut buffer = vec![];
         while let Some(msg) = self.pending.front() {
-            if render_ns.is_some_and(|render_ns| msg.received_ns > render_ns) {
-                break;
-            }
+            let offset_ns = match render_ns {
+                Some(render_ns) if msg.received_ns > render_ns => break,
+                Some(render_ns) => -i64::try_from(render_ns - msg.received_ns).unwrap_or(i64::MAX),
+                None => 0,
+            };
+            buffer.extend_from_slice(format!(r#"{{"offset_ns":{offset_ns},"message":"#).as_bytes());
             buffer.extend_from_slice(&msg.data);
+            buffer.push(b'}');
             self.pending.pop_front();
         }
         buffer
@@ -449,25 +460,37 @@ mod tests {
     fn takes_the_messages_received_before_the_frame() {
         let (sender, receiver) = mpsc::channel();
         let mut queue = MessageQueue::new(receiver);
-        sender.send(message(10, b"a")).unwrap();
-        sender.send(message(20, b"b")).unwrap();
-        sender.send(message(30, b"c")).unwrap();
+        sender.send(message(10, b"1")).unwrap();
+        sender.send(message(20, b"2")).unwrap();
+        sender.send(message(30, b"3")).unwrap();
 
         assert_eq!(queue.take_received_before(Some(5)), b"");
-        assert_eq!(queue.take_received_before(Some(20)), b"ab");
-        sender.send(message(40, b"d")).unwrap();
-        assert_eq!(queue.take_received_before(Some(35)), b"c");
+        assert_eq!(
+            queue.take_received_before(Some(20)),
+            br#"{"offset_ns":-10,"message":1}{"offset_ns":0,"message":2}"#
+        );
+        sender.send(message(40, b"4")).unwrap();
+        assert_eq!(
+            queue.take_received_before(Some(35)),
+            br#"{"offset_ns":-5,"message":3}"#
+        );
         assert_eq!(queue.take_received_before(Some(35)), b"");
-        assert_eq!(queue.take_received_before(Some(40)), b"d");
+        assert_eq!(
+            queue.take_received_before(Some(40)),
+            br#"{"offset_ns":0,"message":4}"#
+        );
     }
 
     #[test]
     fn takes_everything_without_render_time() {
         let (sender, receiver) = mpsc::channel();
         let mut queue = MessageQueue::new(receiver);
-        sender.send(message(10, b"a")).unwrap();
+        sender.send(message(10, b"1")).unwrap();
         assert_eq!(queue.take_received_before(Some(5)), b"");
-        sender.send(message(20, b"b")).unwrap();
-        assert_eq!(queue.take_received_before(None), b"ab");
+        sender.send(message(20, b"2")).unwrap();
+        assert_eq!(
+            queue.take_received_before(None),
+            br#"{"offset_ns":0,"message":1}{"offset_ns":0,"message":2}"#
+        );
     }
 }

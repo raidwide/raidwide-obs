@@ -197,7 +197,7 @@ fn run_dummy(sender: &mpsc::Sender<Message>, stop: &AtomicBool) {
     while sleep_unless_stopped(Duration::from_secs(1), stop) {
         obs_debug!("Simulating WebSocket data");
         if sender
-            .send(Message::received_now(b"SEI RAIDWIDE".to_vec()))
+            .send(Message::received_now(br#"{"msgtype":"RaidwideDummy"}"#.to_vec()))
             .is_err()
         {
             break;
