@@ -3,6 +3,7 @@ use std::ffi;
 use std::mem;
 use std::ptr;
 use std::slice;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{self, mpsc};
 
 use crate::calldata;
@@ -29,6 +30,8 @@ struct OutputHook {
     /// Only used by the packet callback, which OBS doesn't run concurrently
     /// for an output, so the lock is never contended
     messages: sync::Mutex<MessageQueue>,
+    /// Set once the output was found to encode with another codec than H.264
+    unsupported_codec: AtomicBool,
     _connection: ws::Connection,
 }
 
@@ -213,6 +216,7 @@ fn hook_output(source: &RaidwideSource, output: *mut obs_sys::obs_output_t, rest
     let (sender, receiver) = mpsc::channel();
     let hook = Box::new(OutputHook {
         messages: sync::Mutex::new(MessageQueue::new(receiver)),
+        unsupported_codec: AtomicBool::new(false),
         _connection: ws::Connection::spawn(ws_url, sender),
     });
     unsafe {
@@ -374,23 +378,23 @@ unsafe fn add_sei(
     pkt_time: *mut obs_sys::encoder_packet_time,
     param: *mut ffi::c_void,
 ) {
-    let mut pkt = unsafe { pkt_ref.as_mut_unchecked() }.to_owned();
-    if pkt.type_ != obs_sys::obs_encoder_type_OBS_ENCODER_VIDEO {
+    if unsafe { (*pkt_ref).type_ } != obs_sys::obs_encoder_type_OBS_ENCODER_VIDEO {
         return;
     }
-
-    if unsafe { ffi::CStr::from_ptr(obs_sys::obs_encoder_get_codec(pkt.encoder)) } != c"h264" {
-        obs_debug!("Unsupported codec");
-        return;
-    }
-
+    let mut pkt = unsafe { pkt_ref.read() };
     let hook = unsafe { param.cast::<OutputHook>().as_ref_unchecked() };
-    let output_name = unsafe { ffi::CStr::from_ptr(obs_sys::obs_output_get_name(output)) };
-    obs_debug!(
-        "Received packet of size {} on output {}",
-        pkt.size,
-        output_name.to_string_lossy(),
-    );
+
+    let codec = unsafe { ffi::CStr::from_ptr(obs_sys::obs_encoder_get_codec(pkt.encoder)) };
+    if codec != c"h264" {
+        if !hook.unsupported_codec.swap(true, Ordering::Relaxed) {
+            obs_warning!(
+                "Output {} encodes its video with {}, only H.264 is supported: no data is added to it",
+                output_name(output),
+                codec.to_string_lossy()
+            );
+        }
+        return;
+    }
 
     // OBS matches the timing to the packet by PTS, it is missing if that fails
     let render_ns = unsafe { pkt_time.as_ref() }.map(|time| time.cts);
@@ -413,36 +417,31 @@ unsafe fn add_sei(
     }
 
     // to properly handle ref_count on encoder_packet, we create a new
-    // encoder_packet with a ref_count of 1 with our sei data prepended to the
+    // encoder_packet with a ref_count of 1 with our sei data inserted in the
     // original data, and decrement the ref_count of the original packet.
     let old_pkt_data = unsafe { slice::from_raw_parts(pkt.data, pkt.size) };
+    let (before_sei, after_sei) = old_pkt_data.split_at(sei::h264_insertion_offset(old_pkt_data));
     let new_pkt_data = unsafe {
         let new_pkt_size = ENCODER_PACKET_ALLOC_OFFSET + sei_size + old_pkt_data.len();
         let new_pkt_ptr = obs_sys::bmalloc(new_pkt_size);
         slice::from_raw_parts_mut(new_pkt_ptr.cast::<u8>(), new_pkt_size)
     };
 
-    new_pkt_data[0..ENCODER_PACKET_ALLOC_OFFSET]
-        .copy_from_slice(&ffi::c_long::from(1).to_ne_bytes());
-    new_pkt_data[ENCODER_PACKET_ALLOC_OFFSET..ENCODER_PACKET_ALLOC_OFFSET + sei_size]
-        .copy_from_slice(&sei_nal);
-    new_pkt_data[ENCODER_PACKET_ALLOC_OFFSET + sei_size..].copy_from_slice(old_pkt_data);
+    let (ref_count, data) = new_pkt_data.split_at_mut(ENCODER_PACKET_ALLOC_OFFSET);
+    ref_count.copy_from_slice(&ffi::c_long::from(1).to_ne_bytes());
+    let (data_before_sei, rest) = data.split_at_mut(before_sei.len());
+    let (data_sei, data_after_sei) = rest.split_at_mut(sei_size);
+    data_before_sei.copy_from_slice(before_sei);
+    data_sei.copy_from_slice(&sei_nal);
+    data_after_sei.copy_from_slice(after_sei);
 
     unsafe { obs_sys::obs_encoder_packet_release(pkt_ref) };
 
-    pkt.size = new_pkt_data.len() - ENCODER_PACKET_ALLOC_OFFSET;
-    pkt.data = unsafe {
-        new_pkt_data
-            .as_mut_ptr()
-            .byte_add(ENCODER_PACKET_ALLOC_OFFSET)
-    };
+    pkt.size = data.len();
+    pkt.data = data.as_mut_ptr();
+    unsafe { *pkt_ref = pkt };
 
-    unsafe {
-        // TODO: check if its aligned
-        ptr::write_unaligned(pkt_ref, pkt);
-    }
-
-    obs_info!("Appended {} bytes of SEI data", sei_size);
+    obs_debug!("Added {} bytes of SEI data", sei_size);
 }
 
 #[cfg(test)]
