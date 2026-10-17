@@ -1,5 +1,6 @@
 mod calldata;
 mod log;
+mod output_hook;
 mod sei;
 mod source;
 mod ws;
@@ -53,11 +54,13 @@ pub extern "C" fn obs_module_load() -> bool {
             size_of::<obs_sys::obs_source_info>(),
         );
     }
+    output_hook::load();
 
     true
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn obs_module_unload() {
+    catch_panic("module unload", (), output_hook::unload);
     obs_info!("Plugin unloaded");
 }
