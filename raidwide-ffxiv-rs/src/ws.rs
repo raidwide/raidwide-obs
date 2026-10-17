@@ -18,6 +18,10 @@ const READ_TIMEOUT: Duration = Duration::from_millis(100);
 /// Delay before reconnecting, doubled after each failed attempt up to the max
 const MIN_RETRY_DELAY: Duration = Duration::from_secs(1);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
+/// The OverlayPlugin events forwarded, subscribed to once connected. The
+/// cached ones (zone, primary player, party) are sent right away with their
+/// current value, so that a recording starting anywhere knows them
+const SUBSCRIBE: &str = r#"{"call":"subscribe","events":["LogLine","ChangeZone","ChangePrimaryPlayer","PartyChanged"]}"#;
 
 /// An OverlayPlugin message, with when it was received on OBS's clock
 /// (`os_gettime_ns`), the clock of the frames' render times
@@ -110,12 +114,17 @@ fn run(url: &str, sender: &mpsc::Sender<Message>, stop: &AtomicBool) {
 
     while !stop.load(Ordering::Relaxed) {
         match connect(url) {
-            Ok(ws) => {
+            Ok(mut ws) => {
                 obs_info!("Connected to {url}");
                 retry_delay = MIN_RETRY_DELAY;
                 failed_attempts = 0;
-                if !forward(ws, sender, stop) {
-                    return;
+                match ws.send(tungstenite::Message::text(SUBSCRIBE)) {
+                    Ok(()) => {
+                        if !forward(ws, sender, stop) {
+                            return;
+                        }
+                    }
+                    Err(e) => obs_warning!("Failed to subscribe to {url}, reconnecting: {e}"),
                 }
             }
             Err(e) if cfg!(feature = "dummy-producer") => {
@@ -204,7 +213,7 @@ fn run_dummy(sender: &mpsc::Sender<Message>, stop: &AtomicBool) {
         obs_debug!("Simulating WebSocket data");
         if sender
             .send(Message::received_now(
-                br#"{"msgtype":"RaidwideDummy"}"#.to_vec(),
+                br#"{"type":"RaidwideDummy"}"#.to_vec(),
             ))
             .is_err()
         {
@@ -226,6 +235,7 @@ mod tests {
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             let mut ws = tungstenite::accept(stream).unwrap();
+            assert_eq!(ws.read().unwrap(), tungstenite::Message::text(SUBSCRIBE));
             ws.send(tungstenite::Message::text("{\"type\":\"ChangeZone\"}"))
                 .unwrap();
             ws.send(tungstenite::Message::Ping(Default::default()))
