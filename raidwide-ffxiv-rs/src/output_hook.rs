@@ -31,7 +31,9 @@ struct OutputHook {
     messages: sync::Mutex<MessageQueue>,
     /// Set once the output was found to encode with another codec than H.264
     unsupported_codec: AtomicBool,
-    _connection: ws::Connection,
+    /// Replaced when the WebSocket URL changes, sending to the same queue
+    connection: sync::Mutex<ws::Connection>,
+    sender: mpsc::Sender<ws::Message>,
 }
 
 /// An output's messages, waiting for the first frame rendered after them.
@@ -199,9 +201,26 @@ pub fn remove_source() {
     }
 }
 
-/// The OverlayPlugin WebSocket URL, used from the next output activation
+/// The OverlayPlugin WebSocket URL. The active outputs reconnect to it, keeping
+/// their packet callback and the messages not inserted yet
 pub fn set_ws_url(ws_url: String) {
-    lock(&RAIDWIDE.state).ws_url = ws_url;
+    let mut state = lock(&RAIDWIDE.state);
+    // Sources are updated with unchanged settings too, e.g. when created
+    if state.ws_url == ws_url {
+        return;
+    }
+    state.ws_url = ws_url;
+
+    for tracked in &state.outputs {
+        let Some(hook) = &tracked.hook else {
+            continue;
+        };
+        obs_debug!("Reconnecting an active output to {}", state.ws_url);
+        let connection = ws::Connection::spawn(state.ws_url.clone(), hook.sender.clone());
+        // Not joined: OBS updates the source on every keystroke in the URL
+        // field, and the previous connection may be stuck connecting
+        mem::replace(&mut *lock(&hook.connection), connection).stop_in_background();
+    }
 }
 
 pub fn ws_url() -> String {
@@ -299,7 +318,8 @@ fn hook_output(output: *mut obs_sys::obs_output_t, restart: bool) {
     let hook = Box::new(OutputHook {
         messages: sync::Mutex::new(MessageQueue::new(receiver)),
         unsupported_codec: AtomicBool::new(false),
-        _connection: ws::Connection::spawn(ws_url, sender),
+        connection: sync::Mutex::new(ws::Connection::spawn(ws_url, sender.clone())),
+        sender,
     });
     unsafe {
         obs_sys::obs_output_add_packet_callback(

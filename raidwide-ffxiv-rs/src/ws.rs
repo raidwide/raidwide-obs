@@ -59,6 +59,12 @@ impl Connection {
             thread: Some(thread),
         }
     }
+
+    /// Stop the connection without waiting for its thread to finish
+    pub fn stop_in_background(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.thread = None;
+    }
 }
 
 impl Drop for Connection {
