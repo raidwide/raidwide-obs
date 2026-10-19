@@ -7,32 +7,40 @@ pub const RAIDWIDE_UUID: [u8; UUID_SIZE] = [
     0x72, 0x61, 0x69, 0x64, 0x77, 0x69, 0x64, 0x65, 0xFF, 0x14, 0xFF, 0x14, 0xFF, 0x14, 0xFF, 0x14,
 ];
 
-const NAL_TYPE_AUD: u8 = 9;
+/// NAL unit types of the slices, the access unit's VCL NALs: non-IDR (1) to
+/// IDR (5)
+const NAL_TYPES_SLICE: std::ops::RangeInclusive<u8> = 1..=5;
 
-/// Where to insert an SEI NAL in an H.264 Annex B access unit: after its
-/// access unit delimiter when it starts with one, since the AUD must be the
-/// access unit's first NAL (parsers split access units on it), at its start
-/// otherwise. OBS' encoders emit AUDs along with repeated headers, which OBS
-/// enables for streams other than RTMP (SRT, RIST, WHIP, HLS)
+/// Where to insert an SEI NAL in an H.264 Annex B access unit: before its
+/// first slice, after the access unit delimiter and the parameter sets that
+/// precede it. A parser can only read an SEI once it knows the SPS: in an
+/// MPEG-TS stream (SRT, RIST, ...) the first access unit is the only one with
+/// them, which OBS' encoders repeat in-band, and an SEI ahead of them is
+/// dropped (GStreamer's h264parse does). At the end of an access unit without
+/// slice, at its start if it isn't Annex B
 pub fn h264_insertion_offset(access_unit: &[u8]) -> usize {
-    // The first start code, 3 or 4 bytes long
-    let header = match find_start_code(access_unit, 0) {
-        Some(start @ (0 | 1)) => start + 3,
-        _ => return 0,
-    };
-    if access_unit
-        .get(header)
-        .is_none_or(|nal| nal & 0x1F != NAL_TYPE_AUD)
-    {
-        return 0;
-    }
-
-    match find_start_code(access_unit, header + 1) {
-        // Including the leading zero of a 4 bytes start code. The AUD's last
-        // byte can't be zero, it ends with its stop bit
-        Some(start) if access_unit[start - 1] == 0 => start - 1,
+    let mut start = match find_start_code(access_unit, 0) {
         Some(start) => start,
-        None => access_unit.len(),
+        None => return 0,
+    };
+    loop {
+        let header = start + 3;
+        if access_unit
+            .get(header)
+            .is_some_and(|nal| NAL_TYPES_SLICE.contains(&(nal & 0x1F)))
+        {
+            // Including the leading zero of a 4 bytes start code. The previous
+            // NAL's last byte can't be zero, it ends with its stop bit
+            return if start > 0 && access_unit[start - 1] == 0 {
+                start - 1
+            } else {
+                start
+            };
+        }
+        match find_start_code(access_unit, header) {
+            Some(next) => start = next,
+            None => return access_unit.len(),
+        }
     }
 }
 
@@ -145,29 +153,50 @@ mod tests {
     }
 
     #[test]
-    fn inserts_after_the_access_unit_delimiter() {
-        // 4 bytes start codes
+    fn inserts_before_the_first_slice() {
+        // AUD then IDR slice, 4 bytes start codes
         assert_eq!(
             h264_insertion_offset(&[0, 0, 0, 1, 9, 0xF0, 0, 0, 0, 1, 0x65, 0x88]),
             6
         );
-        // 3 bytes start codes
+        // AUD then non-IDR slice, 3 bytes start codes
         assert_eq!(
             h264_insertion_offset(&[0, 0, 1, 9, 0x10, 0, 0, 1, 0x41, 0x9A]),
             5
         );
-        // Nothing after it
-        assert_eq!(h264_insertion_offset(&[0, 0, 0, 1, 9, 0xF0]), 6);
+        // Slice first
+        assert_eq!(h264_insertion_offset(&[0, 0, 1, 0x41, 0x9A]), 0);
+        assert_eq!(h264_insertion_offset(&[0, 0, 0, 1, 0x65, 0x88]), 0);
     }
 
     #[test]
-    fn inserts_at_the_start_without_access_unit_delimiter() {
+    fn inserts_after_the_parameter_sets() {
+        // AUD, SPS, PPS, the encoder's SEI then IDR slice, as OBS' first
+        // access unit of an MPEG-TS stream
+        let access_unit = [
+            0, 0, 0, 1, 9, 0x10, // AUD
+            0, 0, 0, 1, 0x67, 0x64, 0x00, 0x1F, // SPS
+            0, 0, 0, 1, 0x68, 0xEE, 0x3C, 0x80, // PPS
+            0, 0, 1, 0x06, 0x05, 0x01, 0x80, // SEI
+            0, 0, 0, 1, 0x65, 0x88, 0x84, // IDR slice
+        ];
+        assert_eq!(h264_insertion_offset(&access_unit), 29);
+        // Without AUD, 3 bytes start code before the slice
         assert_eq!(
             h264_insertion_offset(&[0, 0, 0, 1, 0x67, 0x42, 0, 0, 1, 0x65]),
-            0
+            6
         );
-        assert_eq!(h264_insertion_offset(&[0, 0, 1, 0x41, 0x9A]), 0);
-        assert_eq!(h264_insertion_offset(&[0, 0, 0, 1]), 0);
+    }
+
+    #[test]
+    fn inserts_at_the_end_without_slice() {
+        assert_eq!(h264_insertion_offset(&[0, 0, 0, 1, 9, 0xF0]), 6);
+        assert_eq!(h264_insertion_offset(&[0, 0, 0, 1]), 4);
+    }
+
+    #[test]
+    fn inserts_at_the_start_without_start_code() {
+        assert_eq!(h264_insertion_offset(&[0x65, 0x88]), 0);
         assert_eq!(h264_insertion_offset(&[]), 0);
     }
 }
