@@ -1,11 +1,8 @@
 use std::io;
-use std::io::Write;
 
-pub const UUID_SIZE: usize = 16;
+use super::{UserData, sei};
 
-pub const RAIDWIDE_UUID: [u8; UUID_SIZE] = [
-    0x72, 0x61, 0x69, 0x64, 0x77, 0x69, 0x64, 0x65, 0xFF, 0x14, 0xFF, 0x14, 0xFF, 0x14, 0xFF, 0x14,
-];
+const NAL_HEADER: [u8; 1] = [6]; // SEI
 
 /// NAL unit types of the slices, the access unit's VCL NALs: non-IDR (1) to
 /// IDR (5)
@@ -19,97 +16,25 @@ const NAL_TYPES_SLICE: std::ops::RangeInclusive<u8> = 1..=5;
 /// dropped (GStreamer's h264parse does). At the end of an access unit without
 /// slice, at its start if it isn't Annex B
 pub fn h264_insertion_offset(access_unit: &[u8]) -> usize {
-    let mut start = match find_start_code(access_unit, 0) {
-        Some(start) => start,
-        None => return 0,
-    };
-    loop {
-        let header = start + 3;
-        if access_unit
-            .get(header)
-            .is_some_and(|nal| NAL_TYPES_SLICE.contains(&(nal & 0x1F)))
-        {
-            // Including the leading zero of a 4 bytes start code. The previous
-            // NAL's last byte can't be zero, it ends with its stop bit
-            return if start > 0 && access_unit[start - 1] == 0 {
-                start - 1
-            } else {
-                start
-            };
-        }
-        match find_start_code(access_unit, header) {
-            Some(next) => start = next,
-            None => return access_unit.len(),
-        }
-    }
+    sei::insertion_offset(access_unit, NAL_HEADER.len(), |nal| {
+        NAL_TYPES_SLICE.contains(&(nal[0] & 0x1F))
+    })
 }
 
-/// Index of the first `00 00 01` from `from`
-fn find_start_code(data: &[u8], from: usize) -> Option<usize> {
-    data.get(from..)?
-        .windows(3)
-        .position(|window| window == [0, 0, 1])
-        .map(|position| from + position)
-}
-
-pub struct SeiUserDataUnregistered<'u, 'p> {
-    uuid: &'u [u8; UUID_SIZE],
-    payload: &'p [u8],
-}
-
-impl<'u, 'p> SeiUserDataUnregistered<'u, 'p> {
-    const START_CODE: [u8; 4] = [0, 0, 0, 1];
-    const NAL_HEADER: [u8; 1] = [6]; // SEI = 6
-    const PAYLOAD_TYPE: [u8; 1] = [5]; // Unregistered User Data = 5
-    const NAL_TRAILER: [u8; 1] = [0x80];
-
-    pub fn new(uuid: &'u [u8; UUID_SIZE], payload: &'p [u8]) -> Self {
-        Self { uuid, payload }
-    }
-
-    fn sei_size(&self) -> usize {
-        self.uuid.len() + self.payload.len()
-    }
-
+impl UserData<'_, '_> {
     pub fn encoded_h264_size(&self) -> usize {
-        Self::START_CODE.len()
-            + Self::NAL_HEADER.len()
-            + Self::PAYLOAD_TYPE.len()
-            + (1 + self.sei_size().div_euclid(0xFF)) // size of varint(sei_size)
-            + self.sei_size()
-            + Self::NAL_TRAILER.len()
+        self.encoded_sei_size(&NAL_HEADER)
     }
 
     pub fn encode_h264(&self, out: &mut [u8]) -> io::Result<usize> {
-        if out.len() < self.encoded_h264_size() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "output buffer is too small",
-            ));
-        }
-
-        let mut offset = 0;
-        offset += (&mut out[offset..]).write(&Self::START_CODE)?;
-        offset += (&mut out[offset..]).write(&Self::NAL_HEADER)?;
-        offset += (&mut out[offset..]).write(&Self::PAYLOAD_TYPE)?;
-
-        // TODO: chunk this write if very large
-        for _ in 0..self.sei_size().div_euclid(0xFF) {
-            offset += (&mut out[offset..]).write(&[0xFF])?;
-        }
-        offset += (&mut out[offset..]).write(&[self.sei_size().rem_euclid(0xFF) as u8])?;
-
-        offset += (&mut out[offset..]).write(self.uuid)?;
-        offset += (&mut out[offset..]).write(self.payload)?;
-        offset += (&mut out[offset..]).write(&Self::NAL_TRAILER)?;
-
-        Ok(offset)
+        self.encode_sei(&NAL_HEADER, out)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metadata::{RAIDWIDE_UUID, UUID_SIZE};
 
     /// The SEI NAL as `raidwide/pipeline/h264.py` parses it (and
     /// `tests/session.py` builds it)
@@ -125,7 +50,7 @@ mod tests {
     }
 
     fn encode(payload: &[u8]) -> Vec<u8> {
-        let sei = SeiUserDataUnregistered::new(&RAIDWIDE_UUID, payload);
+        let sei = UserData::new(&RAIDWIDE_UUID, payload);
         let mut out = vec![0; sei.encoded_h264_size()];
         assert_eq!(sei.encode_h264(&mut out).unwrap(), out.len());
         out
@@ -147,7 +72,7 @@ mod tests {
 
     #[test]
     fn rejects_small_output_buffers() {
-        let sei = SeiUserDataUnregistered::new(&RAIDWIDE_UUID, b"{}");
+        let sei = UserData::new(&RAIDWIDE_UUID, b"{}");
         let mut out = vec![0; sei.encoded_h264_size() - 1];
         assert!(sei.encode_h264(&mut out).is_err());
     }

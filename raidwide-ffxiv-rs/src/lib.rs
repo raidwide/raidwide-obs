@@ -1,7 +1,7 @@
 mod calldata;
 mod log;
+pub mod metadata;
 mod output_hook;
-mod sei;
 mod source;
 mod ws;
 

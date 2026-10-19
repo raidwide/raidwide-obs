@@ -8,7 +8,7 @@ use std::sync::{self, mpsc};
 
 use crate::calldata;
 use crate::catch_panic;
-use crate::sei;
+use crate::metadata;
 use crate::ws;
 use crate::{obs_debug, obs_info, obs_warning};
 
@@ -29,7 +29,7 @@ struct OutputHook {
     /// Only used by the packet callback, which OBS doesn't run concurrently
     /// for an output, so the lock is never contended
     messages: sync::Mutex<MessageQueue>,
-    /// Set once the output was found to encode with another codec than H.264
+    /// Set once the output was found to encode with an unsupported codec
     unsupported_codec: AtomicBool,
     /// Replaced when the WebSocket URL changes, sending to the same queue
     connection: sync::Mutex<ws::Connection>,
@@ -59,7 +59,7 @@ impl MessageQueue {
         }
     }
 
-    /// The SEI payload of a frame rendered at `render_ns`: the messages
+    /// The metadata payload of a frame rendered at `render_ns`: the messages
     /// received before it, or all of them when its render time is unknown,
     /// each one as `{"offset_ns":<received - rendered, <= 0>,"message":<raw>}`
     /// (0 without render time), concatenated
@@ -465,13 +465,13 @@ extern "C" fn packet_cb(
     param: *mut ffi::c_void,
 ) {
     catch_panic("packet callback", (), || unsafe {
-        add_sei(output, pkt_ref, pkt_time, param)
+        add_metadata(output, pkt_ref, pkt_time, param)
     })
 }
 
 /// # Safety
 /// The packet callback's arguments, `param` pointing to the output's hook
-unsafe fn add_sei(
+unsafe fn add_metadata(
     output: *mut obs_sys::obs_output_t,
     pkt_ref: *mut obs_sys::encoder_packet,
     pkt_time: *mut obs_sys::encoder_packet_time,
@@ -484,16 +484,19 @@ unsafe fn add_sei(
     let hook = unsafe { param.cast::<OutputHook>().as_ref_unchecked() };
 
     let codec = unsafe { ffi::CStr::from_ptr(obs_sys::obs_encoder_get_codec(pkt.encoder)) };
-    if codec != c"h264" {
-        if !hook.unsupported_codec.swap(true, Ordering::Relaxed) {
-            obs_warning!(
-                "Output {} encodes its video with {}, only H.264 is supported: no data is added to it",
-                output_name(output),
-                codec.to_string_lossy()
-            );
+    let codec = match metadata::Codec::from_obs_name(codec.to_bytes()) {
+        Some(codec) => codec,
+        None => {
+            if !hook.unsupported_codec.swap(true, Ordering::Relaxed) {
+                obs_warning!(
+                    "Output {} encodes its video with {}, only H.264, H.265 and AV1 are supported: no data is added to it",
+                    output_name(output),
+                    codec.to_string_lossy()
+                );
+            }
+            return;
         }
-        return;
-    }
+    };
 
     // OBS matches the timing to the packet by PTS, it is missing if that fails
     let render_ns = unsafe { pkt_time.as_ref() }.map(|time| time.cts);
@@ -507,32 +510,21 @@ unsafe fn add_sei(
         return;
     }
 
-    let sei_data = sei::SeiUserDataUnregistered::new(&sei::RAIDWIDE_UUID, &buffer);
-    let sei_size = sei_data.encoded_h264_size();
-    let mut sei_nal = vec![0; sei_size];
-    if let Err(e) = sei_data.encode_h264(&mut sei_nal) {
-        obs_warning!("Failed to encode the SEI, dropping its data: {e}");
-        return;
-    }
-
     // to properly handle ref_count on encoder_packet, we create a new
-    // encoder_packet with a ref_count of 1 with our sei data inserted in the
+    // encoder_packet with a ref_count of 1 with our metadata inserted in the
     // original data, and decrement the ref_count of the original packet.
     let old_pkt_data = unsafe { slice::from_raw_parts(pkt.data, pkt.size) };
-    let (before_sei, after_sei) = old_pkt_data.split_at(sei::h264_insertion_offset(old_pkt_data));
+    let packet_size = metadata::packet_size(codec, old_pkt_data, &buffer);
+    let metadata_size = packet_size - old_pkt_data.len();
     let new_pkt_data = unsafe {
-        let new_pkt_size = ENCODER_PACKET_ALLOC_OFFSET + sei_size + old_pkt_data.len();
+        let new_pkt_size = ENCODER_PACKET_ALLOC_OFFSET + packet_size;
         let new_pkt_ptr = obs_sys::bmalloc(new_pkt_size);
         slice::from_raw_parts_mut(new_pkt_ptr.cast::<u8>(), new_pkt_size)
     };
 
     let (ref_count, data) = new_pkt_data.split_at_mut(ENCODER_PACKET_ALLOC_OFFSET);
     ref_count.copy_from_slice(&ffi::c_long::from(1).to_ne_bytes());
-    let (data_before_sei, rest) = data.split_at_mut(before_sei.len());
-    let (data_sei, data_after_sei) = rest.split_at_mut(sei_size);
-    data_before_sei.copy_from_slice(before_sei);
-    data_sei.copy_from_slice(&sei_nal);
-    data_after_sei.copy_from_slice(after_sei);
+    metadata::splice_packet(codec, old_pkt_data, &buffer, data).unwrap();
 
     unsafe { obs_sys::obs_encoder_packet_release(pkt_ref) };
 
@@ -540,7 +532,7 @@ unsafe fn add_sei(
     pkt.data = data.as_mut_ptr();
     unsafe { *pkt_ref = pkt };
 
-    obs_debug!("Added {} bytes of SEI data", sei_size);
+    obs_debug!("Added {metadata_size} bytes of {codec:?} metadata");
 }
 
 #[cfg(test)]
