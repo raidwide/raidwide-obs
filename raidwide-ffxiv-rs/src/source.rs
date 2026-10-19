@@ -88,11 +88,7 @@ unsafe extern "C" fn get_properties(data: *mut ffi::c_void) -> *mut obs_sys::obs
 
 unsafe extern "C" fn get_defaults(settings: *mut obs_sys::obs_data_t) {
     unsafe {
-        obs_sys::obs_data_set_default_string(
-            settings,
-            WS_URL,
-            c"ws://127.0.0.1:10500/ws".as_ptr(),
-        );
+        obs_sys::obs_data_set_default_string(settings, WS_URL, c"ws://127.0.0.1:10500/ws".as_ptr());
     }
 }
 
