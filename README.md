@@ -1,6 +1,6 @@
 # Raidwide OBS plugin
 
-OBS plugin for [Raidwide](https://raidwide.example.com), video review for FFXIV raids. It reads the game's combat log from ACT and OverlayPlugin, and embeds it in your recording or live stream, so that Raidwide can split the session into pulls and line up every player's point of view.
+OBS plugin for [Raidwide](https://raidwi.de), video analyzer for Final Fantasy XIV raids. It reads the game's combat log from ACT and OverlayPlugin, and embeds it in your recording or live stream, so that Raidwide can split the session into pulls and line up every player's point of view.
 
 ## Install
 
@@ -27,8 +27,6 @@ cargo build --release
 ```
 
 On Linux, it needs libobs 31 or newer (e.g. from the `ppa:obsproject/obs-studio` PPA on Ubuntu) and libclang. On Windows, an installed OBS of the same version as the submodule; see `.github/workflows/ci.yml` for the exact steps.
-
-Pushing a `v*` tag builds the plugin for Windows and Linux and publishes them as a GitHub release.
 
 ## License
 
