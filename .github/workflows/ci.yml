@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # The plugin needs libobs >= 31, newer than the Ubuntu archive one
+      - name: Install OBS
+        run: |
+          sudo add-apt-repository -y ppa:obsproject/obs-studio
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends obs-studio libsimde-dev libclang-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo clippy --all-targets
+      - run: cargo build --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: raidwide-ffxiv-rs-linux
+          path: target/release/libraidwide_ffxiv_rs.so
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-2022
+    env:
+      # Must match the obs-studio submodule, its headers are used for the bindings
+      OBS_VERSION: 31.1.2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      # obsconfig.h is normally generated when configuring OBS with CMake
+      - name: Generate obsconfig.h
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force obs-sys/obs-studio/build_x64/config
+          Set-Content obs-sys/obs-studio/build_x64/config/obsconfig.h @"
+          #pragma once
+          #define OBS_RELEASE_CANDIDATE 0
+          #define OBS_BETA 0
+          "@
+
+      # build_win.rs locates OBS through the registry key set by its installer
+      - name: Install OBS
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: |
+          $zip = "OBS-Studio-$env:OBS_VERSION-Windows-x64.zip"
+          Invoke-WebRequest "https://github.com/obsproject/obs-studio/releases/download/$env:OBS_VERSION/$zip" -OutFile $zip
+          Expand-Archive $zip -DestinationPath obs-studio
+          reg add "HKLM\SOFTWARE\OBS Studio" /ve /d "$env:RUNNER_TEMP\obs-studio" /f /reg:32
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo clippy --all-targets
+      - run: cargo build --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: raidwide-ffxiv-rs-windows
+          path: target/release/raidwide_ffxiv_rs.dll
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/artifacts
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes \
+            "$RUNNER_TEMP/artifacts/raidwide-ffxiv-rs-windows/raidwide_ffxiv_rs.dll" \
+            "$RUNNER_TEMP/artifacts/raidwide-ffxiv-rs-linux/libraidwide_ffxiv_rs.so"
