@@ -14,7 +14,9 @@ Then, with ACT and OverlayPlugin running:
 
 ## How it works
 
-The plugin hooks OBS' outputs and inserts the events it receives from OverlayPlugin in the encoded H.264 video, as user data unregistered SEI messages with the UUID `7261696477696465FF14FF14FF14FF14` ("raidwide" followed by `FF14` four times). They survive recording to a file and streaming over SRT, and players don't see them. See `raidwide-ffxiv-rs/src/sei.rs`.
+The plugin hooks OBS' outputs and inserts the events it receives from OverlayPlugin in the encoded video, without re-encoding: as user data SEI messages in H.264 and HEVC, as a metadata OBU in AV1, all starting with the UUID `7261696477696465FF14FF14FF14FF14` ("raidwide" followed by `FF14` four times). They survive recording to a file and streaming over SRT, and viewers don't see them. The framing of each codec is described in [`raidwide-ffxiv-rs/README.md`](raidwide-ffxiv-rs/README.md).
+
+Raidwide only analyzes H.264 videos for now: keep OBS' encoder on H.264 (x264, NVENC H.264, ...).
 
 ## Build
 
