@@ -17,10 +17,6 @@ Then, with ACT and OverlayPlugin running:
 2. In its properties, check the **WebSocket URL** of OverlayPlugin's WebSocket server (`ws://127.0.0.1:10500/ws` by default), and click **Test Connection**.
 3. Record or stream as usual: the combat log is embedded in the video.
 
-## How it works
-
-The plugin hooks OBS' outputs and inserts the events it receives from OverlayPlugin in the encoded H.264 video, as user data unregistered SEI messages with the UUID `7261696477696465FF14FF14FF14FF14` ("raidwide" followed by `FF14` four times). They survive recording to a file and streaming over SRT, and players don't see them. See `raidwide-ffxiv-rs/src/sei.rs`.
-
 ## Build
 
 The OBS headers come from the `obs-studio` submodule:
