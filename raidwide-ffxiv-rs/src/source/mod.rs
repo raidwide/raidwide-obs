@@ -20,6 +20,7 @@ pub static mut RAIDWIDE_SOURCE: obs_sys::obs_source_info = obs_sys::obs_source_i
 };
 
 pub const WS_URL: *const ffi::c_char = c"ws_url".as_ptr();
+pub const REPEAT_FRAMES: *const ffi::c_char = c"repeat_frames".as_ptr();
 pub const TEST_WS_BUTTON: *const ffi::c_char = c"test_ws_button".as_ptr();
 pub const TEST_WS_RESULT: *const ffi::c_char = c"test_ws_result".as_ptr();
 
@@ -55,6 +56,8 @@ unsafe extern "C" fn update(_data: *mut ffi::c_void, settings: *mut obs_sys::obs
     catch_panic("source update", (), || {
         let ws_url = unsafe { ffi::CStr::from_ptr(obs_sys::obs_data_get_string(settings, WS_URL)) };
         output_hook::set_ws_url(ws_url.to_string_lossy().into_owned());
+        let repeat_frames = unsafe { obs_sys::obs_data_get_int(settings, REPEAT_FRAMES) };
+        output_hook::set_repeat_frames(u32::try_from(repeat_frames.max(0)).unwrap_or(u32::MAX));
     })
 }
 
@@ -66,6 +69,18 @@ unsafe extern "C" fn get_properties(data: *mut ffi::c_void) -> *mut obs_sys::obs
             WS_URL,
             c"WebSocket URL".as_ptr(),
             obs_sys::obs_text_type_OBS_TEXT_DEFAULT,
+        );
+        let repeat_frames = obs_sys::obs_properties_add_int(
+            properties,
+            REPEAT_FRAMES,
+            c"Repeat data in the next frames".as_ptr(),
+            0,
+            output_hook::MAX_REPEAT_FRAMES as i32,
+            1,
+        );
+        obs_sys::obs_property_set_long_description(
+            repeat_frames,
+            c"Also sends the game data in this many frames after the first one, so that frames lost on an unreliable live connection don't lose it. 0 sends it once, which is enough for recordings and reliable connections".as_ptr(),
         );
         obs_sys::obs_properties_add_button2(
             properties,
@@ -88,11 +103,8 @@ unsafe extern "C" fn get_properties(data: *mut ffi::c_void) -> *mut obs_sys::obs
 
 unsafe extern "C" fn get_defaults(settings: *mut obs_sys::obs_data_t) {
     unsafe {
-        obs_sys::obs_data_set_default_string(
-            settings,
-            WS_URL,
-            c"ws://127.0.0.1:10500/ws".as_ptr(),
-        );
+        obs_sys::obs_data_set_default_string(settings, WS_URL, c"ws://127.0.0.1:10500/ws".as_ptr());
+        obs_sys::obs_data_set_default_int(settings, REPEAT_FRAMES, 1);
     }
 }
 
