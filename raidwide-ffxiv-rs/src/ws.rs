@@ -285,14 +285,19 @@ mod tests {
 
     #[test]
     fn stops_while_waiting_to_reconnect() {
-        // Bound then dropped, so nothing listens on that port
-        let url = {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            format!("ws://{}", listener.local_addr().unwrap())
-        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            assert_eq!(ws.read().unwrap(), tungstenite::Message::text(SUBSCRIBE));
+            // Disconnect after subscribing so the client enters the retry delay.
+        });
 
         let (sender, _receiver) = mpsc::channel();
         let connection = Connection::spawn(url, sender);
+        server.join().unwrap();
+        // Allow the client to observe the disconnect before testing shutdown.
         thread::sleep(READ_TIMEOUT * 3);
 
         let start = Instant::now();
