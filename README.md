@@ -4,19 +4,18 @@ OBS plugin for [Raidwide](https://raidwi.de), video analyzer for Final Fantasy X
 
 ## Install
 
-Download `raidwide_ffxiv_rs.dll` from the [latest release](../../releases/latest), and copy it to `C:\Program Files\obs-studio\obs-plugins\64bit\`. It needs OBS 31 or newer.
+Download `raidwide_ffxiv_rs.dll` from the [latest release](../../releases/latest). It needs OBS 31 or newer. Copy it, keeping its name, to:
+
+- OBS 33 or newer: `C:\ProgramData\obs-studio\plugins\raidwide_ffxiv_rs\raidwide_ffxiv_rs.dll`
+- OBS 31 or 32: `C:\ProgramData\obs-studio\plugins\raidwide_ffxiv_rs\bin\64bit\raidwide_ffxiv_rs.dll`
+
+Create the folders if needed. Older guides mention `C:\Program Files\obs-studio\obs-plugins\64bit\`: OBS 33 flags plugins there as legacy, and OBS 34 won't load them. See OBS' [plugin locations](https://obsproject.com/kb/legacy-plugin-developer-info).
 
 Then, with ACT and OverlayPlugin running:
 
 1. Add a **Raidwide** source to your scene collection.
 2. In its properties, check the **WebSocket URL** of OverlayPlugin's WebSocket server (`ws://127.0.0.1:10500/ws` by default), and click **Test Connection**.
 3. Record or stream as usual: the combat log is embedded in the video.
-
-## How it works
-
-The plugin hooks OBS' outputs and inserts the events it receives from OverlayPlugin in the encoded video, without re-encoding: as user data SEI messages in H.264 and HEVC, as a metadata OBU in AV1, all starting with the UUID `7261696477696465FF14FF14FF14FF14` ("raidwide" followed by `FF14` four times). They survive recording to a file and streaming over SRT, and viewers don't see them. The framing of each codec is described in [`raidwide-ffxiv-rs/README.md`](raidwide-ffxiv-rs/README.md).
-
-Raidwide only analyzes H.264 videos for now: keep OBS' encoder on H.264 (x264, NVENC H.264, ...).
 
 ## Build
 
