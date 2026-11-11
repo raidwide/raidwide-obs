@@ -1,5 +1,7 @@
 # Raidwide OBS plugin
 
+[![CI](https://github.com/raidwide/raidwide-obs/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/raidwide/raidwide-obs/actions/workflows/ci.yml)
+
 OBS plugin for [Raidwide](https://raidwi.de), video analyzer for Final Fantasy XIV raids. It reads the game's combat log from ACT and OverlayPlugin, and embeds it in your recording or live stream, so that Raidwide can split the session into pulls and line up every player's point of view.
 
 ## Install
