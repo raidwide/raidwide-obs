@@ -46,9 +46,16 @@ struct OutputHook {
 /// displayed ahead of it, and takes the messages received before them too.
 /// So each message goes with its offset to the render of the frame carrying
 /// it, for the analysis to place it at that frame's PTS plus the offset.
+///
+/// Each message is also numbered, from 0 for each hook (a hook lives while its
+/// output is active), so the analysis can tell when messages were lost (frames
+/// or packets dropped on a live link) and, once messages are duplicated over
+/// several frames, keep a single copy of each
 struct MessageQueue {
     receiver: mpsc::Receiver<ws::Message>,
     pending: VecDeque<ws::Message>,
+    /// Sequence number of the next message taken
+    next_seq: u64,
 }
 
 impl MessageQueue {
@@ -56,13 +63,15 @@ impl MessageQueue {
         Self {
             receiver,
             pending: VecDeque::new(),
+            next_seq: 0,
         }
     }
 
     /// The SEI payload of a frame rendered at `render_ns`: the messages
     /// received before it, or all of them when its render time is unknown,
-    /// each one as `{"offset_ns":<received - rendered, <= 0>,"message":<raw>}`
-    /// (0 without render time), concatenated
+    /// each one as
+    /// `{"seq":<n>,"offset_ns":<received - rendered, <= 0>,"message":<raw>}`
+    /// (offset 0 without render time), concatenated
     fn take_received_before(&mut self, render_ns: Option<u64>) -> Vec<u8> {
         // Received in order, so the pending messages are sorted
         self.pending.extend(self.receiver.try_iter());
@@ -74,10 +83,14 @@ impl MessageQueue {
                 Some(render_ns) => -i64::try_from(render_ns - msg.received_ns).unwrap_or(i64::MAX),
                 None => 0,
             };
-            buffer.extend_from_slice(format!(r#"{{"offset_ns":{offset_ns},"message":"#).as_bytes());
+            let seq = self.next_seq;
+            buffer.extend_from_slice(
+                format!(r#"{{"seq":{seq},"offset_ns":{offset_ns},"message":"#).as_bytes(),
+            );
             buffer.extend_from_slice(&msg.data);
             buffer.push(b'}');
             self.pending.pop_front();
+            self.next_seq += 1;
         }
         buffer
     }
@@ -565,17 +578,17 @@ mod tests {
         assert_eq!(queue.take_received_before(Some(5)), b"");
         assert_eq!(
             queue.take_received_before(Some(20)),
-            br#"{"offset_ns":-10,"message":1}{"offset_ns":0,"message":2}"#
+            br#"{"seq":0,"offset_ns":-10,"message":1}{"seq":1,"offset_ns":0,"message":2}"#
         );
         sender.send(message(40, b"4")).unwrap();
         assert_eq!(
             queue.take_received_before(Some(35)),
-            br#"{"offset_ns":-5,"message":3}"#
+            br#"{"seq":2,"offset_ns":-5,"message":3}"#
         );
         assert_eq!(queue.take_received_before(Some(35)), b"");
         assert_eq!(
             queue.take_received_before(Some(40)),
-            br#"{"offset_ns":0,"message":4}"#
+            br#"{"seq":3,"offset_ns":0,"message":4}"#
         );
     }
 
@@ -588,7 +601,7 @@ mod tests {
         sender.send(message(20, b"2")).unwrap();
         assert_eq!(
             queue.take_received_before(None),
-            br#"{"offset_ns":0,"message":1}{"offset_ns":0,"message":2}"#
+            br#"{"seq":0,"offset_ns":0,"message":1}{"seq":1,"offset_ns":0,"message":2}"#
         );
     }
 }
