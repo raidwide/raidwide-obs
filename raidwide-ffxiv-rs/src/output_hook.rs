@@ -3,7 +3,7 @@ use std::ffi;
 use std::mem;
 use std::ptr;
 use std::slice;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{self, mpsc};
 
 use crate::calldata;
@@ -49,13 +49,27 @@ struct OutputHook {
 ///
 /// Each message is also numbered, from 0 for each hook (a hook lives while its
 /// output is active), so the analysis can tell when messages were lost (frames
-/// or packets dropped on a live link) and, once messages are duplicated over
-/// several frames, keep a single copy of each
+/// or packets dropped on a live link) and keep a single copy of the repeated
+/// ones.
+///
+/// Messages can be repeated in the next frames (`set_repeat_frames`), so that
+/// one frame lost on a live link doesn't lose them. Each copy gets its offset
+/// to the frame carrying it, so whichever copy the analysis keeps is placed
+/// right
 struct MessageQueue {
     receiver: mpsc::Receiver<ws::Message>,
     pending: VecDeque<ws::Message>,
+    /// Messages already sent, to send again in the next frames
+    repeating: VecDeque<Repeat>,
     /// Sequence number of the next message taken
     next_seq: u64,
+}
+
+struct Repeat {
+    seq: u64,
+    message: ws::Message,
+    /// Copies left to send
+    remaining: u32,
 }
 
 impl MessageQueue {
@@ -63,37 +77,72 @@ impl MessageQueue {
         Self {
             receiver,
             pending: VecDeque::new(),
+            repeating: VecDeque::new(),
             next_seq: 0,
         }
     }
 
-    /// The SEI payload of a frame rendered at `render_ns`: the messages
-    /// received before it, or all of them when its render time is unknown,
-    /// each one as
+    /// The SEI payload of a frame rendered at `render_ns`: the copies of the
+    /// messages already sent, then the messages received before it, or all
+    /// of them when its render time is unknown, each one as
     /// `{"seq":<n>,"offset_ns":<received - rendered, <= 0>,"message":<raw>}`
-    /// (offset 0 without render time), concatenated
-    fn take_received_before(&mut self, render_ns: Option<u64>) -> Vec<u8> {
+    /// (offset 0 without render time), concatenated. Each new message is sent
+    /// again in the next `repeat` frames rendered after it
+    fn take_received_before(&mut self, render_ns: Option<u64>, repeat: u32) -> Vec<u8> {
         // Received in order, so the pending messages are sorted
         self.pending.extend(self.receiver.try_iter());
 
         let mut buffer = vec![];
+        for copy in &mut self.repeating {
+            // Skips the frames rendered before the message, B-frames decoded
+            // after the frame that carried it
+            let Some(offset_ns) = offset_ns(render_ns, copy.message.received_ns) else {
+                continue;
+            };
+            append_message(&mut buffer, copy.seq, offset_ns, &copy.message.data);
+            copy.remaining -= 1;
+        }
+        self.repeating.retain(|copy| copy.remaining > 0);
+
         while let Some(msg) = self.pending.front() {
-            let offset_ns = match render_ns {
-                Some(render_ns) if msg.received_ns > render_ns => break,
-                Some(render_ns) => -i64::try_from(render_ns - msg.received_ns).unwrap_or(i64::MAX),
-                None => 0,
+            let Some(offset_ns) = offset_ns(render_ns, msg.received_ns) else {
+                break;
             };
             let seq = self.next_seq;
-            buffer.extend_from_slice(
-                format!(r#"{{"seq":{seq},"offset_ns":{offset_ns},"message":"#).as_bytes(),
-            );
-            buffer.extend_from_slice(&msg.data);
-            buffer.push(b'}');
-            self.pending.pop_front();
+            append_message(&mut buffer, seq, offset_ns, &msg.data);
             self.next_seq += 1;
+            let Some(message) = self.pending.pop_front() else {
+                break;
+            };
+            if repeat > 0 {
+                self.repeating.push_back(Repeat {
+                    seq,
+                    message,
+                    remaining: repeat,
+                });
+            }
         }
         buffer
     }
+}
+
+/// Offset of a message received at `received_ns` to the render of the frame
+/// carrying it, 0 when the render time is unknown, None when the frame was
+/// rendered before the message
+fn offset_ns(render_ns: Option<u64>, received_ns: u64) -> Option<i64> {
+    match render_ns {
+        Some(render_ns) if received_ns > render_ns => None,
+        Some(render_ns) => Some(-i64::try_from(render_ns - received_ns).unwrap_or(i64::MAX)),
+        None => Some(0),
+    }
+}
+
+fn append_message(buffer: &mut Vec<u8>, seq: u64, offset_ns: i64, data: &[u8]) {
+    buffer.extend_from_slice(
+        format!(r#"{{"seq":{seq},"offset_ns":{offset_ns},"message":"#).as_bytes(),
+    );
+    buffer.extend_from_slice(data);
+    buffer.push(b'}');
 }
 
 impl TrackedOutput {
@@ -166,6 +215,13 @@ static RAIDWIDE: Raidwide = Raidwide {
     }),
 };
 
+/// How many frames after the first one each message is repeated in, set by
+/// the sources (the last one set wins, as the URL)
+static REPEAT_FRAMES: AtomicU32 = AtomicU32::new(1);
+
+/// Upper bound of `set_repeat_frames`
+pub const MAX_REPEAT_FRAMES: u32 = 10;
+
 fn lock<T>(mutex: &sync::Mutex<T>) -> sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(sync::PoisonError::into_inner)
 }
@@ -234,6 +290,12 @@ pub fn set_ws_url(ws_url: String) {
         // field, and the previous connection may be stuck connecting
         mem::replace(&mut *lock(&hook.connection), connection).stop_in_background();
     }
+}
+
+/// Repeats each message in the next `frames` frames (0: sent once), up to
+/// `MAX_REPEAT_FRAMES`. Applies to the frames encoded from now on
+pub fn set_repeat_frames(frames: u32) {
+    REPEAT_FRAMES.store(frames.min(MAX_REPEAT_FRAMES), Ordering::Relaxed);
 }
 
 pub fn ws_url() -> String {
@@ -514,7 +576,7 @@ unsafe fn add_sei(
         .messages
         .lock()
         .unwrap_or_else(sync::PoisonError::into_inner)
-        .take_received_before(render_ns);
+        .take_received_before(render_ns, REPEAT_FRAMES.load(Ordering::Relaxed));
 
     if buffer.is_empty() {
         return;
@@ -575,19 +637,19 @@ mod tests {
         sender.send(message(20, b"2")).unwrap();
         sender.send(message(30, b"3")).unwrap();
 
-        assert_eq!(queue.take_received_before(Some(5)), b"");
+        assert_eq!(queue.take_received_before(Some(5), 0), b"");
         assert_eq!(
-            queue.take_received_before(Some(20)),
+            queue.take_received_before(Some(20), 0),
             br#"{"seq":0,"offset_ns":-10,"message":1}{"seq":1,"offset_ns":0,"message":2}"#
         );
         sender.send(message(40, b"4")).unwrap();
         assert_eq!(
-            queue.take_received_before(Some(35)),
+            queue.take_received_before(Some(35), 0),
             br#"{"seq":2,"offset_ns":-5,"message":3}"#
         );
-        assert_eq!(queue.take_received_before(Some(35)), b"");
+        assert_eq!(queue.take_received_before(Some(35), 0), b"");
         assert_eq!(
-            queue.take_received_before(Some(40)),
+            queue.take_received_before(Some(40), 0),
             br#"{"seq":3,"offset_ns":0,"message":4}"#
         );
     }
@@ -597,11 +659,42 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         let mut queue = MessageQueue::new(receiver);
         sender.send(message(10, b"1")).unwrap();
-        assert_eq!(queue.take_received_before(Some(5)), b"");
+        assert_eq!(queue.take_received_before(Some(5), 0), b"");
         sender.send(message(20, b"2")).unwrap();
         assert_eq!(
-            queue.take_received_before(None),
+            queue.take_received_before(None, 0),
             br#"{"seq":0,"offset_ns":0,"message":1}{"seq":1,"offset_ns":0,"message":2}"#
         );
+    }
+
+    #[test]
+    fn repeats_the_messages_in_the_next_frames() {
+        let (sender, receiver) = mpsc::channel();
+        let mut queue = MessageQueue::new(receiver);
+        sender.send(message(10, b"1")).unwrap();
+        assert_eq!(
+            queue.take_received_before(Some(20), 2),
+            br#"{"seq":0,"offset_ns":-10,"message":1}"#
+        );
+        sender.send(message(25, b"2")).unwrap();
+        // The copies first, with their offset to this frame
+        assert_eq!(
+            queue.take_received_before(Some(30), 2),
+            br#"{"seq":0,"offset_ns":-20,"message":1}{"seq":1,"offset_ns":-5,"message":2}"#
+        );
+        // A B-frame rendered before message 2 only carries message 1
+        assert_eq!(
+            queue.take_received_before(Some(22), 2),
+            br#"{"seq":0,"offset_ns":-12,"message":1}"#
+        );
+        assert_eq!(
+            queue.take_received_before(Some(40), 2),
+            br#"{"seq":1,"offset_ns":-15,"message":2}"#
+        );
+        assert_eq!(
+            queue.take_received_before(Some(50), 2),
+            br#"{"seq":1,"offset_ns":-25,"message":2}"#
+        );
+        assert_eq!(queue.take_received_before(Some(60), 2), b"");
     }
 }
