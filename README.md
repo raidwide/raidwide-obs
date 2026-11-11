@@ -31,4 +31,4 @@ On Linux, it needs libobs 31 or newer (e.g. from the `ppa:obsproject/obs-studio`
 
 ## License
 
-GPL-2.0-or-later, as OBS, which the plugin links against: the GNU General Public License version 2, or (at your option) any later version. See `LICENSE` for the version 2 text.
+GPL-2.0-or-later (see `LICENSE`). OBS Studio is under the same license, and plugins that link against it must be GPL-compatible.
