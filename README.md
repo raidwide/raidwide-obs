@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/raidwide/raidwide-obs/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/raidwide/raidwide-obs/actions/workflows/ci.yml)
 
-OBS plugin for [Raidwide](https://raidwi.de), video analyzer for Final Fantasy XIV raids. It reads the game's combat log from ACT with OverlayPlugin, or from IINACT, and embeds it in your recording or live stream, so that Raidwide can split the session into pulls and line up every player's point of view.
+OBS plugin for [Raidwide](https://raidwi.de), video analyzer for Final Fantasy XIV raids. It reads the game's combat log from IINACT, or from ACT with OverlayPlugin, and embeds it in your recording or live stream, so that Raidwide can split the session into pulls and line up every player's point of view.
 
 ## Install
 
@@ -13,10 +13,10 @@ Download `raidwide_ffxiv_rs.dll` from the [latest release](../../releases/latest
 
 Create the folders if needed. Older guides mention `C:\Program Files\obs-studio\obs-plugins\64bit\`: OBS 33 flags plugins there as legacy, and OBS 34 won't load them. See OBS' [plugin locations](https://obsproject.com/kb/legacy-plugin-developer-info).
 
-Then, with ACT and OverlayPlugin, or IINACT, running:
+Then, with IINACT, or ACT and OverlayPlugin, running:
 
 1. Add a **Raidwide** source to your scene collection.
-2. In its properties, check the **WebSocket URL**: `ws://127.0.0.1:10500/ws` by default, OverlayPlugin's in ACT. IINACT's is `ws://127.0.0.1:10501/ws`. Then click **Test Connection**.
+2. In its properties, check the **WebSocket URL**: `ws://127.0.0.1:10501/ws` by default, IINACT's. With ACT, OverlayPlugin's is `ws://127.0.0.1:10500/ws`. Then click **Test Connection**.
 3. Record or stream as usual: the combat log is embedded in the video.
 
 ## Build
