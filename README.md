@@ -6,12 +6,18 @@ OBS plugin for [Raidwide](https://raidwi.de), video analyzer for Final Fantasy X
 
 ## Install
 
-Download `raidwide_ffxiv_rs.dll` from the [latest release](../../releases/latest). It needs OBS 31 or newer. Copy it, keeping its name, to:
+The plugin needs OBS 31 or newer. Close OBS, then download and run [`raidwide-obs-setup.exe`](../../releases/latest/download/raidwide-obs-setup.exe). It finds your OBS version and installs the plugin where that version loads it, and can be uninstalled from Windows' Apps settings. The installer isn't signed yet: if Windows shows "Windows protected your PC", click **More info**, then **Run anyway**.
+
+### Manual install
+
+Download `raidwide_ffxiv_rs.dll` from the [latest release](../../releases/latest). Copy it, keeping its name, to:
 
 - OBS 33 or newer: `C:\ProgramData\obs-studio\plugins\raidwide_ffxiv_rs\raidwide_ffxiv_rs.dll`
 - OBS 31 or 32: `C:\ProgramData\obs-studio\plugins\raidwide_ffxiv_rs\bin\64bit\raidwide_ffxiv_rs.dll`
 
 Create the folders if needed. Older guides mention `C:\Program Files\obs-studio\obs-plugins\64bit\`: OBS 33 flags plugins there as legacy, and OBS 34 won't load them. See OBS' [plugin locations](https://obsproject.com/kb/legacy-plugin-developer-info).
+
+### Setup
 
 Then, with IINACT, or ACT and OverlayPlugin, running:
 

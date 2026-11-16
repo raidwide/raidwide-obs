@@ -80,6 +80,20 @@ jobs:
           path: target/release/raidwide_ffxiv_rs.dll
           if-no-files-found: error
 
+      # Inno Setup 6 comes with the windows-2022 image
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $version = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME.TrimStart('v') } else { "0.0.0-dev+$($env:GITHUB_SHA.Substring(0, 7))" }
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" installer\raidwide-obs.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: raidwide-obs-setup
+          path: target/installer/raidwide-obs-setup.exe
+          if-no-files-found: error
+
   release:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [linux, windows]
@@ -96,5 +110,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes \
+            "$RUNNER_TEMP/artifacts/raidwide-obs-setup/raidwide-obs-setup.exe" \
             "$RUNNER_TEMP/artifacts/raidwide-ffxiv-rs-windows/raidwide_ffxiv_rs.dll" \
             "$RUNNER_TEMP/artifacts/raidwide-ffxiv-rs-linux/libraidwide_ffxiv_rs.so"
